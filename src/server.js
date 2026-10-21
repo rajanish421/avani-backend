@@ -5,6 +5,15 @@ const app = require('./app');
 const FcmNotificationService = require('./services/fcmNotificationService');
 const DailyGreetingsService = require('./services/dailyGreetingsService');
 
+// Prevent unhandled rejections or uncaught errors from crashing the background server
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[SERVER UNHANDLED REJECTION]', reason instanceof Error ? (reason.stack || reason.message) : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[SERVER UNCAUGHT EXCEPTION]', err.stack || err.message);
+});
+
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
