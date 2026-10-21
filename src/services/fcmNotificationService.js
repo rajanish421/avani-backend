@@ -103,6 +103,8 @@ class FcmNotificationService {
         priority: 'high',
         notification: {
           channelId: 'institute_high_importance_channel',
+          icon: 'ic_notification',
+          color: '#0B3B8B',
           sound: 'default',
           priority: 'max',
           defaultSound: true,
@@ -156,6 +158,8 @@ class FcmNotificationService {
         priority: 'high',
         notification: {
           channelId: 'institute_high_importance_channel',
+          icon: 'ic_notification',
+          color: '#0B3B8B',
           sound: 'default',
           priority: 'max',
           defaultSound: true,
