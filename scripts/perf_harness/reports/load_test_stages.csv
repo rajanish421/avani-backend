@@ -1,0 +1,8 @@
+Stage,Students,Admins,DurationSec,FirestoreReads,FirestoreWrites,ReadsPerStudent,WritesPerStudent,RtdbWrites,RtdbPeakConns,AvgLatencyMs,P95LatencyMs,Errors,TransferKB
+stage_0_smoke,1,1,29,162,4,162.0,4.0,4,2,1785,13358,0,73
+stage_1_10,10,1,28,993,21,99.3,2.1,39,11,2548,15537,1,586
+stage_2_50,50,1,60,4779,93,95.6,1.9,200,51,3346,20180,0,4329
+stage_3_100,100,1,98,9573,153,95.7,1.5,400,101,2139,11724,0,10424
+stage_4_200,200,1,166,19167,303,95.8,1.5,800,201,2144,11618,0,26941
+stage_5_500_projected,500,1,0,48175,805,96.3,1.6,2000,500,0,0,1,21800
+stage_6_1000_projected,1000,1,0,96200,1600,96.2,1.6,4000,1000,0,0,1,43525
