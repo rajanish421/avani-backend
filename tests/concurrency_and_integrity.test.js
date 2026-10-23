@@ -28,7 +28,7 @@ test.after(async () => {
 
 test('Concurrent Registration, Counter Integrity, and Rollback Suite', async (t) => {
   await t.test('1. Concurrent registrations assign unique consecutive IDs without duplicate IDs', async () => {
-    const counterDocBefore = await db.collection('system_counters').doc('student_id').get();
+    const counterDocBefore = await db.collection('system_counters').doc('student_id_test').get();
     const initialCounter = counterDocBefore.data()?.currentValue || 0;
 
     const numConcurrent = 4;
@@ -77,13 +77,13 @@ test('Concurrent Registration, Counter Integrity, and Rollback Suite', async (t)
     assert.equal(uniqueIds.size, numConcurrent, 'All concurrent registrations must receive unique Student IDs');
 
     // Verify counter increment matches exact number of registrations
-    const counterDocAfter = await db.collection('system_counters').doc('student_id').get();
+    const counterDocAfter = await db.collection('system_counters').doc('student_id_test').get();
     const finalCounter = counterDocAfter.data()?.currentValue || 0;
     assert.equal(finalCounter, initialCounter + numConcurrent, 'Counter must increment exactly by concurrent batch size');
   });
 
   await t.test('2. Transaction abort / invalid payload leaves counter unchanged (no skipped or burned IDs)', async () => {
-    const counterDocBefore = await db.collection('system_counters').doc('student_id').get();
+    const counterDocBefore = await db.collection('system_counters').doc('student_id_test').get();
     const counterBefore = counterDocBefore.data()?.currentValue || 0;
 
     // Send invalid payload (missing required DOB)
@@ -106,7 +106,7 @@ test('Concurrent Registration, Counter Integrity, and Rollback Suite', async (t)
 
     assert.equal(res.status, 400);
 
-    const counterDocAfter = await db.collection('system_counters').doc('student_id').get();
+    const counterDocAfter = await db.collection('system_counters').doc('student_id_test').get();
     const counterAfter = counterDocAfter.data()?.currentValue || 0;
     assert.equal(counterAfter, counterBefore, 'Failed request must not increment or burn the student ID sequence counter');
   });

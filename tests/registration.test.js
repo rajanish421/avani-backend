@@ -86,7 +86,7 @@ test('Student Registration, Idempotency, Counter Integrity, and Auth Suite', asy
   });
 
   await t.test('2. Idempotent retry with exact same requestId returns same student without incrementing counter', async () => {
-    const counterBefore = (await db.collection('system_counters').doc('student_id').get()).data()?.currentValue;
+    const counterBefore = (await db.collection('system_counters').doc('student_id_test').get()).data()?.currentValue;
 
     const payload = {
       requestId: requestId1, // Identical requestId
@@ -115,7 +115,7 @@ test('Student Registration, Idempotency, Counter Integrity, and Auth Suite', asy
     assert.equal(json.idempotent, true, 'Should indicate idempotent response');
     assert.equal(json.studentId, createdStudentId1, 'Should return same Student ID');
 
-    const counterAfter = (await db.collection('system_counters').doc('student_id').get()).data()?.currentValue;
+    const counterAfter = (await db.collection('system_counters').doc('student_id_test').get()).data()?.currentValue;
     assert.equal(counterAfter, counterBefore, 'Counter must not increment on idempotent retry');
   });
 

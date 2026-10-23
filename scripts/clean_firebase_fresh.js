@@ -99,7 +99,13 @@ async function cleanData(mode = 'smart') {
 
   // 3. Reset system counter to 0 so fresh registration starts at ACI00001
   console.log('\n[3/4] Resetting student registration sequence counter to 0...');
+  await db.collection('system_counters').doc('student_id').set({
+    currentValue: 0,
+    prefix: 'ACI',
+    resetAt: new Date().toISOString(),
+  });
   await db.collection('system_counters').doc('student_registration').set({
+    currentValue: 0,
     lastSequence: 0,
     prefix: 'ACI',
     padding: 5,

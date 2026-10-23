@@ -145,7 +145,11 @@ class StudentRegistrationService {
 
     // 5. Final Atomic Firestore Transaction
     // Assigns student ID, writes student, enrollment, fees, lookup and updates counter
-    const counterRef = db.collection('system_counters').doc('student_id');
+    // Uses isolated counter for tests to prevent burning production student sequences
+    const counterDocId = (process.env.NODE_ENV === 'test' || process.env.IS_TEST)
+      ? 'student_id_test'
+      : 'student_id';
+    const counterRef = db.collection('system_counters').doc(counterDocId);
     const studentRef = db.collection('students').doc(predeterminedUid);
     const enrollmentRef = db.collection('enrollments').doc(`enr_${predeterminedUid}`);
     const feeAccountRef = db.collection('fee_accounts').doc(`fee_${predeterminedUid}`);
