@@ -374,10 +374,10 @@ class DailyGreetingsService {
   }
 
   /**
-   * Schedule automated morning check (between 8:00 AM and 9:00 AM IST)
+   * Schedule automated morning check (between 7:00 AM and 8:00 AM IST)
    */
   static scheduleMorningGreetings() {
-    console.log('[DAILY GREETINGS] Initializing automated morning greeting cron timer (8:00 AM – 9:00 AM IST)');
+    console.log('[DAILY GREETINGS] Initializing automated morning greeting cron timer (7:00 AM – 8:00 AM IST)');
 
     // Run a check shortly after startup if during morning window
     setTimeout(() => {
@@ -401,8 +401,10 @@ class DailyGreetingsService {
     const parts = istFormatter.formatToParts(now);
     const hour = parseInt(parts.find((p) => p.type === 'hour').value, 10);
 
-    // Active morning delivery window: 8:00 AM - 10:00 AM IST
-    if (hour >= 8 && hour < 10) {
+    // Active morning delivery window starts at 7:00 AM IST.
+    // If hour >= 7, check and trigger greetings for today if not already sent.
+    // Deduplication via daily_greetings_log guarantees it only executes once per day.
+    if (hour >= 7) {
       this.checkAndTriggerGreetings().catch((err) => {
         console.warn('[DAILY GREETINGS CRON] Execution warning:', err.message);
       });

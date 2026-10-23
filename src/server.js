@@ -36,7 +36,7 @@ app.listen(PORT, () => {
     });
   }, 6 * 60 * 60 * 1000);
 
-  // Initialize automated morning festival and birthday greeting scheduler (8:00 AM – 9:00 AM IST)
+  // Initialize automated morning festival and birthday greeting scheduler (7:00 AM – 8:00 AM IST)
   try {
     DailyGreetingsService.scheduleMorningGreetings();
   } catch (err) {
