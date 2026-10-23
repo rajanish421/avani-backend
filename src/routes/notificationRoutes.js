@@ -318,22 +318,26 @@ router.post('/birthday-wish', async (req, res, next) => {
 });
 
 /**
- * POST /api/notifications/trigger-daily-greetings
- * Trigger: Automated morning or manual administrator dispatch of festival & birthday wishes
- * Body: { date, force }
+ * GET & POST /api/notifications/trigger-daily-greetings
+ * Trigger: Automated morning external cron (cron-job.org / UptimeRobot) or manual dispatch of festival & birthday wishes
+ * Query or Body: { date, force }
  */
-router.post('/trigger-daily-greetings', async (req, res, next) => {
+const handleDailyGreetingsTrigger = async (req, res, next) => {
   try {
-    const { date, force } = req.body || {};
+    const date = req.query.date || (req.body && req.body.date) || null;
+    const force = req.query.force === 'true' || Boolean(req.body && req.body.force);
     const result = await DailyGreetingsService.checkAndTriggerGreetings({
-      date: date || null,
-      force: Boolean(force),
+      date,
+      force,
     });
     res.status(200).json({ success: true, ...result });
   } catch (err) {
     next(err);
   }
-});
+};
+
+router.get('/trigger-daily-greetings', handleDailyGreetingsTrigger);
+router.post('/trigger-daily-greetings', handleDailyGreetingsTrigger);
 
 /**
  * GET /api/notifications/student/:studentUid
