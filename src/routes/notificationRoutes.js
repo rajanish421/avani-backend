@@ -332,9 +332,11 @@ const handleDailyGreetingsTrigger = async (req, res, next) => {
     });
     // Ultra-compact response for cron monitoring services (avoids output size limit errors)
     res.status(200).json({
+      success: true,
       status: 'ok',
       date: result.date,
-      festival: result.festival ? (result.festival.sent ? 'sent' : result.festival.reason || 'skipped') : 'none',
+      festival: result.festival,
+      birthdays: result.birthdays,
       birthdaysSent: (result.birthdays || []).filter(b => b.sent).length,
     });
   } catch (err) {

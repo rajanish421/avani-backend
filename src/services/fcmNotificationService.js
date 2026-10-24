@@ -582,8 +582,35 @@ class FcmNotificationService {
     studentUid,
     studentName,
     customMessage = '',
+    dateIso = null,
+    force = false,
   }) {
     if (!studentUid) throw new Error('studentUid is required for birthday wish notification');
+
+    const effectiveDateIso = dateIso || new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+
+    const deterministicNotifId = `birthday_${studentUid}_${effectiveDateIso}`;
+    const notifRef = db.collection('notifications').doc(deterministicNotifId);
+
+    // Atomically prevent duplicate push & duplicate notifications for the same day
+    if (!force) {
+      const existingDoc = await notifRef.get();
+      if (existingDoc.exists) {
+        console.log(`[FCM SERVICE] Birthday notification already sent today for ${studentUid} (${deterministicNotifId}), skipping duplicate.`);
+        return {
+          success: true,
+          alreadySent: true,
+          notificationId: deterministicNotifId,
+          studentUid,
+          skipped: 'Already sent today',
+        };
+      }
+    }
 
     const displayName = studentName || 'Student';
     const title = `🎂 Happy Birthday, ${displayName}! 🎉`;
@@ -596,17 +623,26 @@ class FcmNotificationService {
     const metadata = {
       studentUid,
       route: '/notifications',
+      date: effectiveDateIso,
     };
 
-    // 1. Record in Firestore /notifications strictly for this specific student
-    const notifId = await this.recordInFirestore({
-      studentUid,
-      targetType: 'Specific Student',
+    // 1. Record deterministically in Firestore /notifications
+    const docData = {
+      id: deterministicNotifId,
       title,
-      body,
+      message: body,
       type,
+      targetType: 'Specific Student',
+      studentUid,
+      targetBatchId: '',
+      targetBatchName: '',
       metadata,
-    });
+      read: false,
+      readBy: [],
+      createdAt: FieldValue.serverTimestamp(),
+    };
+
+    await notifRef.set(docData, { merge: true });
 
     // 2. Dispatch FCM Push strictly to student's device token
     let fcmResult = { success: false, reason: 'NO_TOKEN' };
@@ -630,7 +666,7 @@ class FcmNotificationService {
 
     return {
       success: true,
-      notificationId: notifId,
+      notificationId: deterministicNotifId,
       studentUid,
       fcm: fcmResult,
       title,

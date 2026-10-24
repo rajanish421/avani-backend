@@ -204,6 +204,8 @@ class DailyGreetingsService {
     return null;
   }
 
+  static _isRunning = false;
+
   /**
    * Main executor: Checks and triggers morning greetings for festivals & birthdays
    * @param {Object} options
@@ -211,6 +213,25 @@ class DailyGreetingsService {
    * @param {boolean} [options.force] - If true, bypasses daily deduplication log
    */
   static async checkAndTriggerGreetings({ date = null, force = false } = {}) {
+    if (this._isRunning && !force) {
+      console.log('[DAILY GREETINGS] Another check is already in progress, skipping concurrent run.');
+      return {
+        date: this.getTodayIST(date).dateIso,
+        festival: { sent: false, skipped: 'Already executing' },
+        birthdays: [],
+        skipped: 'Concurrent execution blocked',
+      };
+    }
+
+    this._isRunning = true;
+    try {
+      return await this._executeGreetings({ date, force });
+    } finally {
+      this._isRunning = false;
+    }
+  }
+
+  static async _executeGreetings({ date = null, force = false } = {}) {
     const today = this.getTodayIST(date);
     const dateIso = today.dateIso;
     console.log(`[DAILY GREETINGS] Checking greetings for date: ${dateIso} (IST)`);
@@ -322,12 +343,15 @@ class DailyGreetingsService {
             const bRes = await FcmNotificationService.sendBirthdayWishNotification({
               studentUid: student.studentUid,
               studentName: student.studentName,
+              dateIso,
+              force,
             });
             birthdayUidsSent.add(student.studentUid);
             results.birthdays.push({
               studentUid: student.studentUid,
               studentName: student.studentName,
-              sent: true,
+              sent: bRes.alreadySent ? false : bRes.success,
+              skipped: bRes.alreadySent ? 'Already sent today' : undefined,
               notificationId: bRes.notificationId,
             });
           } catch (err) {
