@@ -41,6 +41,33 @@ class ArchiveMigrationService {
 
     const studentDoc = await db.collection('students').doc(studentUid).get();
     if (!studentDoc.exists) {
+      await connectMongo();
+      const existingArchived = await ArchivedStudent.findOne({ studentUid });
+      if (existingArchived) {
+        return {
+          studentUid,
+          studentId: existingArchived.studentId,
+          name: existingArchived.name,
+          course: existingArchived.course,
+          batch: existingArchived.batch,
+          currentStatus: 'Completed',
+          alreadyArchived: true,
+          suggestedCompletionDate: existingArchived.completionDate,
+          feeStatus: {
+            totalFee: existingArchived.feeSummary?.totalFee || 0,
+            paidFee: existingArchived.feeSummary?.paidFee || 0,
+            pendingFee: existingArchived.feeSummary?.pendingFee || 0,
+            isCleared: (existingArchived.feeSummary?.pendingFee || 0) <= 0,
+          },
+          academics: {
+            testsSubmittedCount: existingArchived.testResults?.length || 0,
+            certificatesCount: existingArchived.certificates?.length || 0,
+            attendancePercentage: existingArchived.attendanceSummary?.averageAttendancePct || 0,
+          },
+          readyForArchive: false,
+          warnings: ['This student has already been migrated to MongoDB and pruned from Firestore.'],
+        };
+      }
       throw new Error(`Student ${studentUid} not found in Firestore`);
     }
 
@@ -92,6 +119,27 @@ class ArchiveMigrationService {
 
     const batchDoc = await db.collection('batches').doc(batchId).get();
     if (!batchDoc.exists) {
+      await connectMongo();
+      const existingBatch = await ArchivedBatch.findOne({ batchId });
+      if (existingBatch) {
+        return {
+          batchId,
+          code: existingBatch.code,
+          name: existingBatch.name,
+          course: existingBatch.course,
+          status: 'Archived',
+          alreadyArchived: true,
+          totalStudents: existingBatch.completedStudentsCount || 0,
+          feeOverview: {
+            studentsWithClearedFees: existingBatch.completedStudentsCount || 0,
+            studentsWithPendingFees: 0,
+            totalPendingFeeSum: 0,
+          },
+          students: [],
+          readyForArchive: false,
+          warnings: ['This batch has already been migrated to MongoDB and pruned from Firestore.'],
+        };
+      }
       throw new Error(`Batch ${batchId} not found in Firestore`);
     }
 
@@ -224,6 +272,25 @@ class ArchiveMigrationService {
       // 2. Fetch full operational data from Firestore
       const studentDoc = await db.collection('students').doc(studentUid).get();
       if (!studentDoc.exists) {
+        const existingArchived = await ArchivedStudent.findOne({ studentUid });
+        if (existingArchived) {
+          console.log(`[ARCHIVE] Student ${studentUid} is already migrated to MongoDB and pruned from Firestore.`);
+          auditLog.status = 'COMPLETED';
+          auditLog.verificationPassed = true;
+          auditLog.firestorePruned = true;
+          auditLog.completedAt = new Date();
+          await auditLog.save().catch(() => {});
+          return {
+            success: true,
+            migrationId: activeMigrationId,
+            studentUid,
+            studentId: existingArchived.studentId,
+            name: existingArchived.name,
+            completionDate: existingArchived.completionDate,
+            verified: true,
+            alreadyArchived: true,
+          };
+        }
         throw new Error(`Student ${studentUid} not found in Firestore`);
       }
       const sData = studentDoc.data();
@@ -395,46 +462,10 @@ class ArchiveMigrationService {
       }
       auditLog.verificationPassed = true;
 
-      // 6. Safe Firestore State Transition & Comprehensive Storage Pruning
-      // Replace student document in Firestore with a minimal lightweight tombstone (NO merge)
-      // to prune all heavy fields (photo base64 data, addresses, document uploads) and reduce storage.
-      await db.collection('students').doc(studentUid).set({
-        id: studentUid,
-        uid: studentUid,
-        studentId: sData.studentId || sData.rollNo || '',
-        name: sData.name || '',
-        course: sData.course || '',
-        batch: sData.batch || '',
-        status: 'Completed',
-        isArchived: true,
-        archivedAt: FieldValue.serverTimestamp(),
-        archivedTo: 'mongodb',
-        completionDate,
-        summary: {
-          totalFee,
-          paidFee,
-          pendingFee,
-          attendancePct: Number(sData.attendancePct || 0),
-          testsCount: testResults.length,
-          certificatesCount: certificates.length,
-        },
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-
-      // Update lookup mapping status
+      // 6. Complete Firestore Purge: Delete all records from Firestore to reduce database storage to zero
       const studentIdNorm = sData.studentId || sData.rollNo;
-      if (studentIdNorm) {
-        try {
-          await db.collection('student_id_lookup').doc(studentIdNorm.toUpperCase()).set({
-            studentUid,
-            status: 'Completed',
-            isArchived: true,
-            archivedAt: FieldValue.serverTimestamp(),
-          });
-        } catch (_) {}
-      }
 
-      // Prune ALL heavy operational documents from Firestore to maximize storage reduction
+      // Query subcollections and linked operational documents concurrently
       const [
         enrDoc,
         qrSnap,
@@ -443,6 +474,7 @@ class ArchiveMigrationService {
         certsSnapToPrune,
         certsByUidSnapToPrune,
         attRecordsSnapToPrune,
+        subTestsSnapToPrune,
       ] = await Promise.all([
         db.collection('enrollments').doc(`enr_${studentUid}`).get().catch(() => ({ exists: false })),
         db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
@@ -451,9 +483,18 @@ class ArchiveMigrationService {
         db.collection('certificates').where('studentId', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('certificates').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('students').doc(studentUid).collection('attendance_records').get().catch(() => ({ docs: [] })),
+        db.collection('students').doc(studentUid).collection('test_submissions').get().catch(() => ({ docs: [] })),
       ]);
 
       const pruneBatch = db.batch();
+
+      // Completely remove student root document from Firestore
+      pruneBatch.delete(db.collection('students').doc(studentUid));
+
+      // Completely remove student lookup document from Firestore if present
+      if (studentIdNorm) {
+        pruneBatch.delete(db.collection('student_id_lookup').doc(studentIdNorm.toUpperCase()));
+      }
 
       // Prune fee account
       if (feeDoc.exists) {
@@ -468,6 +509,7 @@ class ArchiveMigrationService {
       (certsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (certsByUidSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (attRecordsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (subTestsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
 
       await pruneBatch.commit();
       auditLog.firestorePruned = true;
@@ -537,6 +579,24 @@ class ArchiveMigrationService {
       // 1. Fetch Batch from Firestore
       const batchDoc = await db.collection('batches').doc(batchId).get();
       if (!batchDoc.exists) {
+        const existingBatch = await ArchivedBatch.findOne({ batchId });
+        if (existingBatch) {
+          console.log(`[ARCHIVE] Batch ${batchId} is already migrated to MongoDB and pruned from Firestore.`);
+          auditLog.status = 'COMPLETED';
+          auditLog.verificationPassed = true;
+          auditLog.firestorePruned = true;
+          auditLog.completedAt = new Date();
+          await auditLog.save().catch(() => {});
+          return {
+            success: true,
+            migrationId: activeMigrationId,
+            batchId,
+            name: existingBatch.name,
+            migratedStudentsCount: existingBatch.completedStudentsCount,
+            verified: true,
+            alreadyArchived: true,
+          };
+        }
         throw new Error(`Batch ${batchId} not found in Firestore`);
       }
       const bData = batchDoc.data();
@@ -655,22 +715,8 @@ class ArchiveMigrationService {
         throw new Error(`Data integrity verification failed for batch ${batchId} in MongoDB`);
       }
 
-      // 6. Update Batch in Firestore: Replace with lightweight tombstone (NO merge)
-      // to prune all heavy student arrays, schedules, and metadata from Firestore
-      await db.collection('batches').doc(batchId).set({
-        id: batchId,
-        batchId: batchId,
-        code: bData.code || '',
-        name: bData.name || '',
-        course: bData.course || '',
-        status: 'Archived',
-        isArchived: true,
-        archivedAt: FieldValue.serverTimestamp(),
-        archivedTo: 'mongodb',
-        studentCount: migratedStudents.length,
-        completionDate: this.getTodayIST(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
+      // 6. Delete Batch in Firestore completely to reduce storage to zero
+      await db.collection('batches').doc(batchId).delete();
 
       // 7. Complete Audit Log
       auditLog.verificationPassed = true;

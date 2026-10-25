@@ -162,11 +162,9 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
     assert.equal(mongoDoc.feeSummary.totalFee, 15000);
     assert.equal(mongoDoc.feeSummary.pendingFee, 5000);
 
-    // Verify Firestore Student is transitioned to Completed with tombstone
+    // Verify Firestore Student is completely pruned/deleted to reduce database storage to zero
     const fsStudentDoc = await db.collection('students').doc(testStudentUid).get();
-    assert.equal(fsStudentDoc.data().status, 'Completed');
-    assert.equal(fsStudentDoc.data().isArchived, true);
-    assert.equal(fsStudentDoc.data().archivedTo, 'mongodb');
+    assert.equal(fsStudentDoc.exists, false, 'Student document must be completely pruned from Firestore to reduce storage');
 
     // Verify operational fee account is safely pruned from Firestore
     const fsFeeDoc = await db.collection('fee_accounts').doc(`fee_${testStudentUid}`).get();
@@ -244,10 +242,9 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
     assert.ok(mongoBatch);
     assert.equal(mongoBatch.status, 'Archived');
 
-    // Verify Firestore Batch status
+    // Verify Firestore Batch is completely pruned/deleted to reduce database storage to zero
     const fsBatch = await db.collection('batches').doc(testBatchId).get();
-    assert.equal(fsBatch.data().status, 'Archived');
-    assert.equal(fsBatch.data().isArchived, true);
+    assert.equal(fsBatch.exists, false, 'Batch document must be completely pruned from Firestore to reduce storage');
   });
 
   // 9. Rollback is permanently disabled to preserve Firestore storage reduction
