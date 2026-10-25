@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node src/server.js",
+    "dev": "node src/server.js",
     "test": "node --dns-result-order=ipv4first --test --test-concurrency=1 tests/registration.test.js tests/concurrency_and_integrity.test.js",
     "test:notifications": "node --dns-result-order=ipv4first --test tests/notifications.test.js",
     "test:archive": "node --dns-result-order=ipv4first --test tests/archive_migration.test.js",

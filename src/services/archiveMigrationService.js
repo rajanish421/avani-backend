@@ -45,20 +45,15 @@ class ArchiveMigrationService {
     }
 
     const studentData = studentDoc.data();
-    const feeDoc = await db.collection('fee_accounts').doc(`fee_${studentUid}`).get();
+
+    // Concurrently fetch fee account, certificates, and test submissions
+    const [feeDoc, certSnap, testsSnap] = await Promise.all([
+      db.collection('fee_accounts').doc(`fee_${studentUid}`).get().catch(() => ({ exists: false, data: () => ({}) })),
+      db.collection('certificates').where('studentId', '==', studentUid).get().catch(() => ({ size: 0 })),
+      db.collection('test_submissions').where('studentUid', '==', studentUid).get().catch(() => ({ size: 0 })),
+    ]);
+
     const feeData = feeDoc.exists ? feeDoc.data() : {};
-
-    // Check certificates
-    const certSnap = await db
-      .collection('certificates')
-      .where('studentId', '==', studentUid)
-      .get();
-
-    // Check test submissions
-    const testsSnap = await db
-      .collection('test_submissions')
-      .where('studentUid', '==', studentUid)
-      .get();
 
     const totalFee = Number(feeData.totalFee ?? studentData.totalFees ?? 0);
     const paidFee = Number(feeData.paidFee ?? studentData.paidFees ?? 0);
@@ -128,16 +123,24 @@ class ArchiveMigrationService {
       }
     }
 
-    let totalBatchStudents = studentDocs.length;
+    const totalBatchStudents = studentDocs.length;
     let studentsWithClearedFees = 0;
     let studentsWithPendingFees = 0;
     let totalPendingFeeSum = 0;
 
+    // Fetch fee records for all batch students concurrently
+    const feeDocs = await Promise.all(
+      studentDocs.map((doc) =>
+        db.collection('fee_accounts').doc(`fee_${doc.id}`).get().catch(() => ({ exists: false, data: () => ({}) }))
+      )
+    );
+
     const studentSummaries = [];
 
-    for (const doc of studentDocs) {
+    for (let i = 0; i < studentDocs.length; i++) {
+      const doc = studentDocs[i];
       const s = doc.data();
-      const feeDoc = await db.collection('fee_accounts').doc(`fee_${doc.id}`).get();
+      const feeDoc = feeDocs[i];
       const f = feeDoc.exists ? feeDoc.data() : {};
       const totalFee = Number(f.totalFee ?? s.totalFees ?? 0);
       const paidFee = Number(f.paidFee ?? s.paidFees ?? 0);
@@ -231,14 +234,18 @@ class ArchiveMigrationService {
         console.log(`[ARCHIVE] Student ${studentUid} is already completed/archived. Re-verifying archive.`);
       }
 
-      // Fetch Fee Account & Payments
-      const feeDoc = await db.collection('fee_accounts').doc(`fee_${studentUid}`).get();
+      // Concurrently fetch Fee Account, Payments, Attendance, Tests, Certificates, and existingArchived
+      const [feeDoc, paymentsSnap, attSubSnap, testSnap, certSnap, existingArchived] = await Promise.all([
+        db.collection('fee_accounts').doc(`fee_${studentUid}`).get().catch(() => ({ exists: false, data: () => ({}) })),
+        db.collection('fee_payments').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('students').doc(studentUid).collection('attendance_records').get().catch(() => ({ docs: [] })),
+        db.collection('test_submissions').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('certificates').where('studentId', '==', studentUid).get().catch(() => ({ docs: [] })),
+        ArchivedStudent.findOne({ studentUid }).lean().catch(() => null),
+      ]);
+
       const feeData = feeDoc.exists ? feeDoc.data() : {};
 
-      const paymentsSnap = await db
-        .collection('fee_payments')
-        .where('studentUid', '==', studentUid)
-        .get();
       const payments = paymentsSnap.docs.map((d) => ({
         paymentId: d.id,
         amount: Number(d.data().amount || 0),
@@ -250,12 +257,6 @@ class ArchiveMigrationService {
         verifiedAt: d.data().verifiedAt || '',
       }));
 
-      // Fetch Attendance records
-      const attSubSnap = await db
-        .collection('students')
-        .doc(studentUid)
-        .collection('attendance_records')
-        .get();
       const attRecords = attSubSnap.docs.map((d) => ({
         id: d.id,
         date: d.data().date || '',
@@ -266,11 +267,6 @@ class ArchiveMigrationService {
       const attendedCount = attRecords.filter((r) => r.status.toLowerCase() === 'present').length;
       const totalAttClasses = attRecords.length > 0 ? attRecords.length : Number(sData.totalClassesHeld || 0);
 
-      // Fetch Test Submissions
-      const testSnap = await db
-        .collection('test_submissions')
-        .where('studentUid', '==', studentUid)
-        .get();
       const testResults = testSnap.docs.map((d) => ({
         testId: d.data().testId || d.id,
         testTitle: d.data().testTitle || d.data().title || 'Module Exam',
@@ -282,11 +278,6 @@ class ArchiveMigrationService {
         date: d.data().submittedAt || '',
       }));
 
-      // Fetch Certificates
-      const certSnap = await db
-        .collection('certificates')
-        .where('studentId', '==', studentUid)
-        .get();
       const certificates = certSnap.docs.map((d) => ({
         certificateId: d.id,
         certificateNo: d.data().certificateNo || d.data().certNo || '',
@@ -295,9 +286,6 @@ class ArchiveMigrationService {
         grade: d.data().grade || 'A',
         downloadUrl: d.data().downloadUrl || d.data().pdfUrl || '',
       }));
-
-      // Check if already archived in MongoDB to preserve existing snapshots across repeated/batch runs
-      const existingArchived = await ArchivedStudent.findOne({ studentUid }).lean();
 
       // Preserve snapshot if feeDoc was already pruned in earlier migration
       const preservedFeeAccount = (feeDoc.exists && Object.keys(feeData).length > 0)
@@ -443,16 +431,16 @@ class ArchiveMigrationService {
       if (feeDoc.exists) {
         pruneBatch.delete(feeDoc.ref);
       }
-      // Prune enrollment
-      const enrDoc = await db.collection('enrollments').doc(`enr_${studentUid}`).get();
+
+      // Fetch enrollment and QR tokens concurrently for pruning
+      const [enrDoc, qrSnap] = await Promise.all([
+        db.collection('enrollments').doc(`enr_${studentUid}`).get().catch(() => ({ exists: false })),
+        db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ forEach: () => {} })),
+      ]);
+
       if (enrDoc.exists) {
         pruneBatch.delete(enrDoc.ref);
       }
-      // Prune QR tokens
-      const qrSnap = await db
-        .collection('qr_tokens')
-        .where('studentUid', '==', studentUid)
-        .get();
       qrSnap.forEach((d) => pruneBatch.delete(d.ref));
 
       await pruneBatch.commit();
