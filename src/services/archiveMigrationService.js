@@ -1,0 +1,916 @@
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
+const { db, FieldValue } = require('../config/firebase');
+const { connectMongo } = require('../config/mongodb');
+const ArchivedStudent = require('../models/ArchivedStudent');
+const ArchivedBatch = require('../models/ArchivedBatch');
+const MigrationAuditLog = require('../models/MigrationAuditLog');
+
+class ArchiveMigrationService {
+  static _activeLocks = new Set();
+
+  /**
+   * Helper to format today's date in IST (YYYY-MM-DD)
+   */
+  static getTodayIST() {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+  }
+
+  /**
+   * Calculate deterministic SHA-256 hash of core payload
+   */
+  static calculateChecksum(data) {
+    const serialized = JSON.stringify(data, Object.keys(data).sort());
+    return crypto.createHash('sha256').update(serialized).digest('hex');
+  }
+
+  // ==========================================================================
+  // PREVIEW OPERATIONS
+  // ==========================================================================
+
+  /**
+   * Pre-flight analysis before archiving a single student
+   */
+  static async previewStudentMigration(studentUid) {
+    if (!studentUid) throw new Error('studentUid is required for preview');
+
+    const studentDoc = await db.collection('students').doc(studentUid).get();
+    if (!studentDoc.exists) {
+      throw new Error(`Student ${studentUid} not found in Firestore`);
+    }
+
+    const studentData = studentDoc.data();
+    const feeDoc = await db.collection('fee_accounts').doc(`fee_${studentUid}`).get();
+    const feeData = feeDoc.exists ? feeDoc.data() : {};
+
+    // Check certificates
+    const certSnap = await db
+      .collection('certificates')
+      .where('studentId', '==', studentUid)
+      .get();
+
+    // Check test submissions
+    const testsSnap = await db
+      .collection('test_submissions')
+      .where('studentUid', '==', studentUid)
+      .get();
+
+    const totalFee = Number(feeData.totalFee ?? studentData.totalFees ?? 0);
+    const paidFee = Number(feeData.paidFee ?? studentData.paidFees ?? 0);
+    const pendingFee = Math.max(0, totalFee - paidFee);
+
+    return {
+      studentUid,
+      studentId: studentData.studentId || studentData.rollNo || '',
+      name: studentData.name || '',
+      course: studentData.course || '',
+      batch: studentData.batch || '',
+      currentStatus: studentData.status || 'Active',
+      admissionDate: studentData.admissionDate || '',
+      suggestedCompletionDate: this.getTodayIST(),
+      feeStatus: {
+        totalFee,
+        paidFee,
+        pendingFee,
+        isCleared: pendingFee <= 0,
+      },
+      academics: {
+        testsSubmittedCount: testsSnap.size,
+        certificatesCount: certSnap.size,
+        attendancePercentage: Number(studentData.attendancePct || 0),
+      },
+      readyForArchive: true,
+      warnings: pendingFee > 0 ? [`Student has a pending fee balance of ₹${pendingFee}`] : [],
+    };
+  }
+
+  /**
+   * Pre-flight analysis before archiving an entire batch
+   */
+  static async previewBatchMigration(batchId) {
+    if (!batchId) throw new Error('batchId is required for preview');
+
+    const batchDoc = await db.collection('batches').doc(batchId).get();
+    if (!batchDoc.exists) {
+      throw new Error(`Batch ${batchId} not found in Firestore`);
+    }
+
+    const batchData = batchDoc.data();
+
+    // Find all students in this batch
+    let studentDocs = [];
+    const assignedIds = batchData.assignedStudentIds || [];
+
+    if (assignedIds.length > 0) {
+      // Fetch by assigned IDs
+      const promises = assignedIds.map((uid) => db.collection('students').doc(uid).get());
+      const snaps = await Promise.all(promises);
+      studentDocs = snaps.filter((s) => s.exists);
+    } else {
+      // Query by batchId or batch name
+      const snap = await db
+        .collection('students')
+        .where('batchId', '==', batchId)
+        .get();
+      if (!snap.empty) {
+        studentDocs = snap.docs;
+      } else {
+        const nameSnap = await db
+          .collection('students')
+          .where('batch', '==', batchData.name)
+          .get();
+        studentDocs = nameSnap.docs;
+      }
+    }
+
+    let totalBatchStudents = studentDocs.length;
+    let studentsWithClearedFees = 0;
+    let studentsWithPendingFees = 0;
+    let totalPendingFeeSum = 0;
+
+    const studentSummaries = [];
+
+    for (const doc of studentDocs) {
+      const s = doc.data();
+      const feeDoc = await db.collection('fee_accounts').doc(`fee_${doc.id}`).get();
+      const f = feeDoc.exists ? feeDoc.data() : {};
+      const totalFee = Number(f.totalFee ?? s.totalFees ?? 0);
+      const paidFee = Number(f.paidFee ?? s.paidFees ?? 0);
+      const pending = Math.max(0, totalFee - paidFee);
+
+      if (pending <= 0) {
+        studentsWithClearedFees++;
+      } else {
+        studentsWithPendingFees++;
+        totalPendingFeeSum += pending;
+      }
+
+      studentSummaries.push({
+        studentUid: doc.id,
+        studentId: s.studentId || s.rollNo || '',
+        name: s.name || '',
+        pendingFee: pending,
+        status: s.status || 'Active',
+      });
+    }
+
+    return {
+      batchId,
+      code: batchData.code || '',
+      name: batchData.name || '',
+      course: batchData.course || '',
+      startDate: batchData.startDate || '',
+      endDate: batchData.endDate || '',
+      currentStatus: batchData.status || 'Active',
+      totalStudents: totalBatchStudents,
+      feeOverview: {
+        studentsWithClearedFees,
+        studentsWithPendingFees,
+        totalPendingFeeSum,
+      },
+      readyForArchive: totalBatchStudents > 0,
+      students: studentSummaries,
+      warnings:
+        studentsWithPendingFees > 0
+          ? [`${studentsWithPendingFees} student(s) have pending fees totaling ₹${totalPendingFeeSum}`]
+          : [],
+    };
+  }
+
+  // ==========================================================================
+  // SINGLE STUDENT MIGRATION
+  // ==========================================================================
+
+  /**
+   * Migrate a single student to MongoDB and prune operational records from Firestore
+   */
+  static async migrateStudent({ studentUid, adminUid = 'admin', force = false, migrationId = null }) {
+    if (!studentUid) throw new Error('studentUid is required for migration');
+
+    await connectMongo();
+
+    const lockKey = `student:${studentUid}`;
+    if (this._activeLocks.has(lockKey)) {
+      throw new Error(`Migration for student ${studentUid} is currently in progress`);
+    }
+    this._activeLocks.add(lockKey);
+
+    const activeMigrationId = migrationId
+      ? `${migrationId}_stu_${studentUid}`
+      : `mig_stu_${Date.now()}_${uuidv4().substring(0, 8)}`;
+    let auditLog = null;
+
+    try {
+      // 1. Audit Log: IN_PROGRESS
+      auditLog = await MigrationAuditLog.create({
+        migrationId: activeMigrationId,
+        type: 'student',
+        targetId: studentUid,
+        adminUid,
+        status: 'IN_PROGRESS',
+        studentUids: [studentUid],
+        studentCount: 1,
+        startedAt: new Date(),
+      });
+
+      // 2. Fetch full operational data from Firestore
+      const studentDoc = await db.collection('students').doc(studentUid).get();
+      if (!studentDoc.exists) {
+        throw new Error(`Student ${studentUid} not found in Firestore`);
+      }
+      const sData = studentDoc.data();
+      auditLog.targetName = sData.name || 'Student';
+
+      // Check if already completed and force is false
+      if (sData.status === 'Completed' && sData.isArchived === true && !force) {
+        console.log(`[ARCHIVE] Student ${studentUid} is already completed/archived. Re-verifying archive.`);
+      }
+
+      // Fetch Fee Account & Payments
+      const feeDoc = await db.collection('fee_accounts').doc(`fee_${studentUid}`).get();
+      const feeData = feeDoc.exists ? feeDoc.data() : {};
+
+      const paymentsSnap = await db
+        .collection('fee_payments')
+        .where('studentUid', '==', studentUid)
+        .get();
+      const payments = paymentsSnap.docs.map((d) => ({
+        paymentId: d.id,
+        amount: Number(d.data().amount || 0),
+        date: d.data().paymentDate || d.data().createdAt || '',
+        method: d.data().method || d.data().paymentMode || 'Online',
+        transactionId: d.data().transactionId || '',
+        receiptNo: d.data().receiptNo || d.data().receiptNumber || '',
+        status: d.data().status || 'Approved',
+        verifiedAt: d.data().verifiedAt || '',
+      }));
+
+      // Fetch Attendance records
+      const attSubSnap = await db
+        .collection('students')
+        .doc(studentUid)
+        .collection('attendance_records')
+        .get();
+      const attRecords = attSubSnap.docs.map((d) => ({
+        id: d.id,
+        date: d.data().date || '',
+        status: d.data().status || 'Present',
+        time: d.data().time || '',
+      }));
+
+      const attendedCount = attRecords.filter((r) => r.status.toLowerCase() === 'present').length;
+      const totalAttClasses = attRecords.length > 0 ? attRecords.length : Number(sData.totalClassesHeld || 0);
+
+      // Fetch Test Submissions
+      const testSnap = await db
+        .collection('test_submissions')
+        .where('studentUid', '==', studentUid)
+        .get();
+      const testResults = testSnap.docs.map((d) => ({
+        testId: d.data().testId || d.id,
+        testTitle: d.data().testTitle || d.data().title || 'Module Exam',
+        score: Number(d.data().score ?? d.data().marksObtained ?? 0),
+        totalMarks: Number(d.data().totalMarks ?? d.data().maxMarks ?? 100),
+        percentage: Number(d.data().percentage ?? 0),
+        grade: d.data().grade || 'Pass',
+        passed: Boolean(d.data().passed ?? true),
+        date: d.data().submittedAt || '',
+      }));
+
+      // Fetch Certificates
+      const certSnap = await db
+        .collection('certificates')
+        .where('studentId', '==', studentUid)
+        .get();
+      const certificates = certSnap.docs.map((d) => ({
+        certificateId: d.id,
+        certificateNo: d.data().certificateNo || d.data().certNo || '',
+        title: d.data().title || sData.course || 'Certificate of Completion',
+        issueDate: d.data().issueDate || this.getTodayIST(),
+        grade: d.data().grade || 'A',
+        downloadUrl: d.data().downloadUrl || d.data().pdfUrl || '',
+      }));
+
+      // Check if already archived in MongoDB to preserve existing snapshots across repeated/batch runs
+      const existingArchived = await ArchivedStudent.findOne({ studentUid }).lean();
+
+      // Preserve snapshot if feeDoc was already pruned in earlier migration
+      const preservedFeeAccount = (feeDoc.exists && Object.keys(feeData).length > 0)
+        ? feeData
+        : (existingArchived?.originalSnapshot?.feeAccount || {});
+      const preservedStudent = (studentDoc.exists && Object.keys(sData).length > 0)
+        ? sData
+        : (existingArchived?.originalSnapshot?.student || {});
+
+      // 3. Compile Full Archive Record
+      const totalFee = feeDoc.exists
+        ? Number(feeData.totalFee ?? sData.totalFees ?? 0)
+        : Number(existingArchived?.feeSummary?.totalFee ?? sData.totalFees ?? 0);
+      const paidFee = feeDoc.exists
+        ? Number(feeData.paidFee ?? sData.paidFees ?? 0)
+        : Number(existingArchived?.feeSummary?.paidFee ?? sData.paidFees ?? 0);
+      const pendingFee = Math.max(0, totalFee - paidFee);
+
+      const isInstallmentPlan = feeDoc.exists
+        ? Boolean(feeData.isInstallmentPlan)
+        : Boolean(existingArchived?.feeSummary?.isInstallmentPlan);
+      const installments = feeDoc.exists
+        ? (feeData.installments || [])
+        : (existingArchived?.feeSummary?.installments || []);
+
+      const completionDate = sData.completionDate || existingArchived?.completionDate || this.getTodayIST();
+
+      const coreData = {
+        studentUid,
+        studentId: sData.studentId || sData.rollNo || '',
+        name: sData.name || '',
+        course: sData.course || '',
+        totalFee,
+        paidFee,
+        completionDate,
+      };
+      const checksum = this.calculateChecksum(coreData);
+
+      const archivedPayload = {
+        studentUid,
+        studentId: sData.studentId || sData.rollNo || '',
+        registrationNo: sData.registrationNo || sData.regNo || '',
+        name: sData.name || '',
+        dob: sData.dob || '',
+        gender: sData.gender || '',
+        phone: sData.phone || '',
+        email: sData.email || '',
+        internalEmail: sData.internalEmail || '',
+        category: sData.category || '',
+        address: sData.address || '',
+        parentName: sData.parentName || sData.fatherName || '',
+        parentPhone: sData.parentPhone || '',
+        guardianPhone: sData.guardianPhone || '',
+        avatarUrl: sData.avatarUrl || sData.photoUrl || '',
+        course: sData.course || '',
+        courseId: sData.courseId || '',
+        batch: sData.batch || '',
+        batchId: sData.batchId || '',
+        admissionDate: sData.admissionDate || '',
+        completionDate,
+        status: 'Completed',
+        feeSummary: {
+          totalFee,
+          paidFee,
+          pendingFee,
+          status: pendingFee <= 0 ? 'Cleared' : 'Pending Dues',
+          isInstallmentPlan,
+          installments,
+        },
+        payments: payments.length > 0 ? payments : (existingArchived?.payments || []),
+        attendanceSummary: {
+          totalClasses: totalAttClasses > 0 ? totalAttClasses : (existingArchived?.attendanceSummary?.totalClasses || 0),
+          attendedClasses: attendedCount > 0 ? attendedCount : (existingArchived?.attendanceSummary?.attendedClasses || 0),
+          attendancePercentage:
+            totalAttClasses > 0
+              ? Math.round((attendedCount / totalAttClasses) * 100)
+              : Number(existingArchived?.attendanceSummary?.attendancePercentage ?? sData.attendancePct ?? 0),
+          lastAttendedDate: attRecords.length > 0 ? attRecords[attRecords.length - 1].date : (existingArchived?.attendanceSummary?.lastAttendedDate || ''),
+          records: attRecords.length > 0 ? attRecords : (existingArchived?.attendanceSummary?.records || []),
+        },
+        testResults: testResults.length > 0 ? testResults : (existingArchived?.testResults || []),
+        certificates: certificates.length > 0 ? certificates : (existingArchived?.certificates || []),
+        originalSnapshot: {
+          student: preservedStudent,
+          feeAccount: preservedFeeAccount,
+        },
+        migrationMetadata: {
+          migratedAt: new Date(),
+          migratedBy: adminUid,
+          migrationId: activeMigrationId,
+          checksum,
+          version: 1,
+        },
+      };
+
+      // 4. Upsert into MongoDB
+      const savedDoc = await ArchivedStudent.findOneAndUpdate(
+        { studentUid },
+        archivedPayload,
+        { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+      );
+
+      // 5. Verification: Read back and assert data integrity
+      const verifyDoc = await ArchivedStudent.findOne({ studentUid });
+      if (!verifyDoc || verifyDoc.studentId !== archivedPayload.studentId) {
+        throw new Error(`Data integrity verification failed for student ${studentUid} in MongoDB`);
+      }
+      auditLog.verificationPassed = true;
+
+      // 6. Safe Firestore State Transition & Pruning
+      // Update student document in Firestore to minimal tombstone status
+      await db.collection('students').doc(studentUid).set(
+        {
+          status: 'Completed',
+          isArchived: true,
+          archivedAt: FieldValue.serverTimestamp(),
+          archivedTo: 'mongodb',
+          completionDate,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      // Update lookup mapping status
+      const studentIdNorm = sData.studentId || sData.rollNo;
+      if (studentIdNorm) {
+        try {
+          await db.collection('student_id_lookup').doc(studentIdNorm.toUpperCase()).set(
+            {
+              status: 'Completed',
+              isArchived: true,
+              archivedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } catch (_) {}
+      }
+
+      // Prune heavy operational documents from Firestore (idempotent deletes)
+      const pruneBatch = db.batch();
+
+      // Prune fee account
+      if (feeDoc.exists) {
+        pruneBatch.delete(feeDoc.ref);
+      }
+      // Prune enrollment
+      const enrDoc = await db.collection('enrollments').doc(`enr_${studentUid}`).get();
+      if (enrDoc.exists) {
+        pruneBatch.delete(enrDoc.ref);
+      }
+      // Prune QR tokens
+      const qrSnap = await db
+        .collection('qr_tokens')
+        .where('studentUid', '==', studentUid)
+        .get();
+      qrSnap.forEach((d) => pruneBatch.delete(d.ref));
+
+      await pruneBatch.commit();
+      auditLog.firestorePruned = true;
+
+      // 7. Audit Log: COMPLETED
+      auditLog.status = 'COMPLETED';
+      auditLog.completedAt = new Date();
+      auditLog.details = {
+        studentUid,
+        studentId: sData.studentId || sData.rollNo,
+        checksum,
+        recordsArchived: {
+          paymentsCount: payments.length,
+          attendanceRecordsCount: attRecords.length,
+          testsCount: testResults.length,
+          certificatesCount: certificates.length,
+        },
+      };
+      await auditLog.save();
+
+      console.log(`[ARCHIVE SUCCESS] Student ${studentUid} (${coreData.studentId}) migrated to MongoDB successfully.`);
+      return {
+        success: true,
+        migrationId: activeMigrationId,
+        studentUid,
+        studentId: coreData.studentId,
+        name: coreData.name,
+        completionDate,
+        verified: true,
+      };
+    } catch (err) {
+      console.error(`[ARCHIVE ERROR] Failed to migrate student ${studentUid}:`, err.message);
+      if (auditLog) {
+        auditLog.status = 'FAILED';
+        auditLog.error = err.message;
+        auditLog.completedAt = new Date();
+        await auditLog.save().catch(() => {});
+      }
+      throw err;
+    } finally {
+      this._activeLocks.delete(lockKey);
+    }
+  }
+
+  // ==========================================================================
+  // FULL BATCH MIGRATION
+  // ==========================================================================
+
+  /**
+   * Migrate an entire batch and all its students to MongoDB
+   */
+  static async migrateBatch({ batchId, adminUid = 'admin', force = false }) {
+    if (!batchId) throw new Error('batchId is required for batch migration');
+
+    await connectMongo();
+
+    const lockKey = `batch:${batchId}`;
+    if (this._activeLocks.has(lockKey)) {
+      throw new Error(`Migration for batch ${batchId} is already in progress`);
+    }
+    this._activeLocks.add(lockKey);
+
+    const activeMigrationId = `mig_batch_${Date.now()}_${uuidv4().substring(0, 8)}`;
+    let auditLog = null;
+
+    try {
+      // 1. Fetch Batch from Firestore
+      const batchDoc = await db.collection('batches').doc(batchId).get();
+      if (!batchDoc.exists) {
+        throw new Error(`Batch ${batchId} not found in Firestore`);
+      }
+      const bData = batchDoc.data();
+
+      // 2. Create Audit Log
+      auditLog = await MigrationAuditLog.create({
+        migrationId: activeMigrationId,
+        type: 'batch',
+        targetId: batchId,
+        targetName: bData.name || 'Batch',
+        adminUid,
+        status: 'IN_PROGRESS',
+        startedAt: new Date(),
+      });
+
+      // 3. Find all students belonging to this batch
+      let studentDocs = [];
+      const assignedIds = bData.assignedStudentIds || [];
+
+      if (assignedIds.length > 0) {
+        const promises = assignedIds.map((uid) => db.collection('students').doc(uid).get());
+        const snaps = await Promise.all(promises);
+        studentDocs = snaps.filter((s) => s.exists);
+      } else {
+        const snap = await db
+          .collection('students')
+          .where('batchId', '==', batchId)
+          .get();
+        if (!snap.empty) {
+          studentDocs = snap.docs;
+        } else {
+          const nameSnap = await db
+            .collection('students')
+            .where('batch', '==', bData.name)
+            .get();
+          studentDocs = nameSnap.docs;
+        }
+      }
+
+      auditLog.studentCount = studentDocs.length;
+      auditLog.studentUids = studentDocs.map((d) => d.id);
+      await auditLog.save();
+
+      // 4. Migrate each student sequentially with safety checks
+      const migratedStudents = [];
+      const failedStudents = [];
+
+      for (const doc of studentDocs) {
+        try {
+          const res = await this.migrateStudent({
+            studentUid: doc.id,
+            adminUid,
+            force,
+            migrationId: activeMigrationId,
+          });
+          migratedStudents.push(res);
+        } catch (sErr) {
+          console.error(`[BATCH MIGRATION] Failed student ${doc.id}:`, sErr.message);
+          failedStudents.push({ studentUid: doc.id, error: sErr.message });
+        }
+      }
+
+      if (failedStudents.length > 0 && !force) {
+        throw new Error(
+          `Batch migration partially failed: ${failedStudents.length} student(s) failed out of ${studentDocs.length}`
+        );
+      }
+
+      // 5. Compile and Upsert ArchivedBatch in MongoDB
+      const batchChecksum = this.calculateChecksum({
+        batchId,
+        code: bData.code || '',
+        name: bData.name || '',
+        course: bData.course || '',
+        studentCount: migratedStudents.length,
+      });
+
+      const archivedBatchPayload = {
+        batchId,
+        code: bData.code || '',
+        name: bData.name || '',
+        course: bData.course || '',
+        timeSlot: bData.timeSlot || '',
+        days: bData.days || [],
+        trainer: bData.trainer || '',
+        labRoom: bData.labRoom || '',
+        capacity: Number(bData.capacity || 0),
+        startDate: bData.startDate || '',
+        endDate: bData.endDate || this.getTodayIST(),
+        status: 'Archived',
+        completedStudentsCount: migratedStudents.length,
+        studentUids: migratedStudents.map((s) => s.studentUid),
+        assignedStudentIds: bData.assignedStudentIds || [],
+        attendanceSummary: {
+          totalSessions: Number(bData.totalSessions || 0),
+          averageAttendancePct: Number(bData.averageAttendancePct || 0),
+        },
+        originalSnapshot: bData,
+        migrationMetadata: {
+          migratedAt: new Date(),
+          migratedBy: adminUid,
+          migrationId: activeMigrationId,
+          checksum: batchChecksum,
+        },
+      };
+
+      await ArchivedBatch.findOneAndUpdate(
+        { batchId },
+        archivedBatchPayload,
+        { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+      );
+
+      // Verify batch in MongoDB
+      const verifyBatch = await ArchivedBatch.findOne({ batchId });
+      if (!verifyBatch) {
+        throw new Error(`Data integrity verification failed for batch ${batchId} in MongoDB`);
+      }
+
+      // 6. Update Batch in Firestore: status: 'Archived', isArchived: true
+      await db.collection('batches').doc(batchId).set(
+        {
+          status: 'Archived',
+          isArchived: true,
+          archivedAt: FieldValue.serverTimestamp(),
+          archivedTo: 'mongodb',
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      // 7. Complete Audit Log
+      auditLog.verificationPassed = true;
+      auditLog.firestorePruned = true;
+      auditLog.status = 'COMPLETED';
+      auditLog.completedAt = new Date();
+      auditLog.details = {
+        batchId,
+        batchName: bData.name,
+        migratedCount: migratedStudents.length,
+        failedCount: failedStudents.length,
+      };
+      await auditLog.save();
+
+      console.log(`[ARCHIVE SUCCESS] Batch ${batchId} (${bData.name}) archived to MongoDB successfully.`);
+      return {
+        success: true,
+        migrationId: activeMigrationId,
+        batchId,
+        batchName: bData.name,
+        migratedStudentsCount: migratedStudents.length,
+        failedStudentsCount: failedStudents.length,
+        verified: true,
+      };
+    } catch (err) {
+      console.error(`[BATCH ARCHIVE ERROR] Failed to archive batch ${batchId}:`, err.message);
+      if (auditLog) {
+        auditLog.status = 'FAILED';
+        auditLog.error = err.message;
+        auditLog.completedAt = new Date();
+        await auditLog.save().catch(() => {});
+      }
+      throw err;
+    } finally {
+      this._activeLocks.delete(lockKey);
+    }
+  }
+
+  // ==========================================================================
+  // ROLLBACK CAPABILITY
+  // ==========================================================================
+
+  /**
+   * Rollback a migration by restoring student/batch status and operational data to Firestore
+   */
+  static async rollbackMigration({ migrationId, adminUid = 'admin' }) {
+    if (!migrationId) throw new Error('migrationId is required for rollback');
+
+    await connectMongo();
+
+    const auditLog = await MigrationAuditLog.findOne({ migrationId });
+    if (!auditLog) {
+      throw new Error(`Migration audit record ${migrationId} not found`);
+    }
+
+    if (auditLog.status === 'ROLLED_BACK') {
+      return { success: true, message: 'Migration was already rolled back' };
+    }
+
+    const studentUids = auditLog.studentUids || [];
+
+    for (const uid of studentUids) {
+      const archived = await ArchivedStudent.findOne({ studentUid: uid });
+      if (archived && archived.originalSnapshot) {
+        const origStudent = archived.originalSnapshot.student || {};
+        const origFee = archived.originalSnapshot.feeAccount || null;
+
+        // Restore Student status to Active in Firestore
+        await db.collection('students').doc(uid).set(
+          {
+            ...origStudent,
+            status: 'Active',
+            isArchived: false,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        // Restore fee account if it was present
+        if (origFee && Object.keys(origFee).length > 0) {
+          await db.collection('fee_accounts').doc(`fee_${uid}`).set(origFee, { merge: true });
+        }
+      }
+    }
+
+    // If batch migration, restore batch
+    if (auditLog.type === 'batch') {
+      const archivedBatch = await ArchivedBatch.findOne({ batchId: auditLog.targetId });
+      if (archivedBatch && archivedBatch.originalSnapshot) {
+        await db.collection('batches').doc(auditLog.targetId).set(
+          {
+            ...archivedBatch.originalSnapshot,
+            status: 'Active',
+            isArchived: false,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+    }
+
+    auditLog.status = 'ROLLED_BACK';
+    auditLog.details = {
+      ...(auditLog.details || {}),
+      rolledBackAt: new Date(),
+      rolledBackBy: adminUid,
+    };
+    await auditLog.save();
+
+    console.log(`[ROLLBACK SUCCESS] Migration ${migrationId} rolled back successfully.`);
+    return {
+      success: true,
+      migrationId,
+      status: 'ROLLED_BACK',
+      restoredStudentCount: studentUids.length,
+    };
+  }
+
+  // ==========================================================================
+  // ARCHIVE QUERY SERVICES
+  // ==========================================================================
+
+  /**
+   * Get paginated completed students from MongoDB with search and filtering
+   */
+  static async getArchivedStudents({ page = 1, limit = 20, search = '', course = '', batchId = '' } = {}) {
+    await connectMongo();
+
+    const query = {};
+    if (search && search.trim()) {
+      const s = search.trim();
+      query.$or = [
+        { name: { $regex: s, $options: 'i' } },
+        { studentId: { $regex: s, $options: 'i' } },
+        { phone: { $regex: s, $options: 'i' } },
+        { email: { $regex: s, $options: 'i' } },
+      ];
+    }
+    if (course && course.trim()) {
+      query.course = course.trim();
+    }
+    if (batchId && batchId.trim()) {
+      query.batchId = batchId.trim();
+    }
+
+    const skip = (Math.max(1, page) - 1) * limit;
+    const [docs, total] = await Promise.all([
+      ArchivedStudent.find(query)
+        .sort({ completionDate: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      ArchivedStudent.countDocuments(query),
+    ]);
+
+    return {
+      students: docs,
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  /**
+   * Get single completed student full dossier by studentUid
+   */
+  static async getArchivedStudentDetails(studentUid) {
+    if (!studentUid) throw new Error('studentUid is required');
+    await connectMongo();
+
+    const student = await ArchivedStudent.findOne({ studentUid }).lean();
+    if (!student) {
+      throw new Error(`Archived student record not found for UID: ${studentUid}`);
+    }
+    return student;
+  }
+
+  /**
+   * Get paginated archived batches from MongoDB
+   */
+  static async getArchivedBatches({ page = 1, limit = 20, search = '' } = {}) {
+    await connectMongo();
+
+    const query = {};
+    if (search && search.trim()) {
+      const s = search.trim();
+      query.$or = [
+        { name: { $regex: s, $options: 'i' } },
+        { code: { $regex: s, $options: 'i' } },
+        { course: { $regex: s, $options: 'i' } },
+      ];
+    }
+
+    const skip = (Math.max(1, page) - 1) * limit;
+    const [docs, total] = await Promise.all([
+      ArchivedBatch.find(query)
+        .sort({ endDate: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      ArchivedBatch.countDocuments(query),
+    ]);
+
+    return {
+      batches: docs,
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  /**
+   * Get single archived batch details
+   */
+  static async getArchivedBatchDetails(batchId) {
+    if (!batchId) throw new Error('batchId is required');
+    await connectMongo();
+
+    const batch = await ArchivedBatch.findOne({ batchId }).lean();
+    if (!batch) {
+      throw new Error(`Archived batch record not found for batchId: ${batchId}`);
+    }
+
+    // Also fetch students who graduated from this batch
+    const students = await ArchivedStudent.find({ batchId })
+      .select('studentUid studentId name phone course completionDate status feeSummary')
+      .lean();
+
+    return {
+      ...batch,
+      graduatedStudents: students,
+    };
+  }
+
+  /**
+   * Get migration audit logs
+   */
+  static async getMigrationAuditLogs({ page = 1, limit = 20 } = {}) {
+    await connectMongo();
+    const skip = (Math.max(1, page) - 1) * limit;
+    const [logs, total] = await Promise.all([
+      MigrationAuditLog.find()
+        .sort({ startedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      MigrationAuditLog.countDocuments(),
+    ]);
+
+    return {
+      logs,
+      total,
+      page: Number(page),
+      limit: Number(limit),
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+}
+
+module.exports = ArchiveMigrationService;

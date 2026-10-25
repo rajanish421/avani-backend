@@ -4,6 +4,7 @@ require('dotenv').config();
 const app = require('./app');
 const FcmNotificationService = require('./services/fcmNotificationService');
 const DailyGreetingsService = require('./services/dailyGreetingsService');
+const { connectMongo } = require('./config/mongodb');
 
 // Prevent unhandled rejections or uncaught errors from crashing the background server
 process.on('unhandledRejection', (reason, promise) => {
@@ -23,6 +24,11 @@ app.listen(PORT, () => {
   console.log(` Health Check: http://localhost:${PORT}/api/health`);
   console.log(` Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`====================================================`);
+
+  // Connect to MongoDB archive database
+  connectMongo().catch((err) => {
+    console.warn('[SERVER INIT] MongoDB connection warning:', err.message);
+  });
 
   // Run initial automated cleanup for notifications older than 30 days
   FcmNotificationService.cleanExpiredNotifications(30).catch((err) => {

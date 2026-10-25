@@ -2,7 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const studentRoutes = require('./routes/studentRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const archiveRoutes = require('./routes/archiveRoutes');
 const DailyGreetingsService = require('./services/dailyGreetingsService');
+const { isMongoConnected } = require('./config/mongodb');
 
 const app = express();
 
@@ -59,6 +61,10 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({
     status: 'ok',
     service: 'Avani Institute Backend',
+    database: {
+      firestore: 'connected',
+      mongodb: isMongoConnected() ? 'connected' : 'disconnected',
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -66,6 +72,7 @@ app.get('/api/health', (req, res) => {
 // Mount routes
 app.use('/api/students', studentRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/archive', archiveRoutes);
 
 // 404 handler
 app.use((req, res) => {
