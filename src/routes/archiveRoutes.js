@@ -14,11 +14,17 @@ const { verifyAdminAuth, verifyStudentAuth } = require('../middleware/auth');
 router.get('/student/my-record', verifyStudentAuth, async (req, res, next) => {
   try {
     const studentUid = req.studentUser?.uid;
-    if (!studentUid) {
+    const studentEmail = req.studentUser?.email;
+    let studentId = req.studentUser?.studentId;
+    if (!studentId && studentEmail && studentEmail.includes('@students.avani.internal')) {
+      studentId = studentEmail.split('@')[0].toUpperCase();
+    }
+
+    if (!studentUid && !studentId && !studentEmail) {
       return res.status(401).json({ error: 'Unauthorized: Student identifier missing from session.' });
     }
 
-    const archiveData = await ArchiveMigrationService.getArchivedStudentDetails(studentUid);
+    const archiveData = await ArchiveMigrationService.getArchivedStudentDetails(studentUid, studentId, studentEmail);
     res.status(200).json({
       success: true,
       data: archiveData,
@@ -72,7 +78,7 @@ router.post('/student/:studentUid/execute', verifyAdminAuth, async (req, res, ne
 
     res.status(200).json({
       success: true,
-      message: `Student ${result.studentId} migrated to MongoDB archive successfully.`,
+      message: `Student ${result.studentId} archived to Institute Permanent Records successfully.`,
       data: result,
     });
   } catch (err) {
@@ -117,7 +123,7 @@ router.post('/batch/:batchId/execute', verifyAdminAuth, async (req, res, next) =
 
     res.status(200).json({
       success: true,
-      message: `Batch ${result.batchName} and ${result.migratedStudentsCount} students archived to MongoDB successfully.`,
+      message: `Batch ${result.batchName} and ${result.migratedStudentsCount} students archived to Institute Permanent Records successfully.`,
       data: result,
     });
   } catch (err) {
@@ -132,7 +138,7 @@ router.post('/batch/:batchId/execute', verifyAdminAuth, async (req, res, next) =
 router.post('/rollback/:migrationId', verifyAdminAuth, async (req, res) => {
   res.status(400).json({
     success: false,
-    error: 'Rollback is permanently disabled. Operational records have been pruned from Cloud Firestore to optimize database storage.',
+    error: 'Rollback is permanently disabled. Operational records have been finalized and archived to Institute Permanent Records.',
   });
 });
 

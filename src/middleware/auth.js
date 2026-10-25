@@ -99,10 +99,11 @@ async function verifyStudentAuth(req, res, next) {
 
   // Development/Test mock token bypass
   if ((process.env.NODE_ENV === 'test' || process.env.NODE_ENV === 'development' || process.env.ALLOW_TEST_AUTH === 'true') && token.startsWith('mock_student_')) {
+    const rawId = token.replace('mock_student_', '');
     req.studentUser = {
-      uid: token.replace('mock_student_', ''),
-      email: `${token}@students.avani.internal`,
-      studentId: 'ACI00001',
+      uid: rawId,
+      email: `${rawId}@students.avani.internal`,
+      studentId: rawId.startsWith('ACI') ? rawId : undefined,
     };
     return next();
   }

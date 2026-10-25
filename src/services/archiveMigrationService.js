@@ -65,7 +65,7 @@ class ArchiveMigrationService {
             attendancePercentage: existingArchived.attendanceSummary?.averageAttendancePct || 0,
           },
           readyForArchive: false,
-          warnings: ['This student has already been migrated to MongoDB and pruned from Firestore.'],
+          warnings: ['This student has already been archived to Institute Permanent Records.'],
         };
       }
       throw new Error(`Student ${studentUid} not found in Firestore`);
@@ -137,7 +137,7 @@ class ArchiveMigrationService {
           },
           students: [],
           readyForArchive: false,
-          warnings: ['This batch has already been migrated to MongoDB and pruned from Firestore.'],
+          warnings: ['This batch has already been archived to Institute Permanent Records.'],
         };
       }
       throw new Error(`Batch ${batchId} not found in Firestore`);
@@ -465,7 +465,7 @@ class ArchiveMigrationService {
       // 6. Complete Firestore Purge: Delete all records from Firestore to reduce database storage to zero
       const studentIdNorm = sData.studentId || sData.rollNo;
 
-      // Query subcollections and linked operational documents concurrently
+      // Prune ALL heavy operational documents and registration requests from Firestore to maximize storage reduction
       const [
         enrDoc,
         qrSnap,
@@ -475,6 +475,8 @@ class ArchiveMigrationService {
         certsByUidSnapToPrune,
         attRecordsSnapToPrune,
         subTestsSnapToPrune,
+        regReqsByUidSnap,
+        regReqsByIdSnap,
       ] = await Promise.all([
         db.collection('enrollments').doc(`enr_${studentUid}`).get().catch(() => ({ exists: false })),
         db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
@@ -484,6 +486,10 @@ class ArchiveMigrationService {
         db.collection('certificates').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('students').doc(studentUid).collection('attendance_records').get().catch(() => ({ docs: [] })),
         db.collection('students').doc(studentUid).collection('test_submissions').get().catch(() => ({ docs: [] })),
+        db.collection('registration_requests').where('uid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        studentIdNorm
+          ? db.collection('registration_requests').where('studentId', '==', studentIdNorm.toUpperCase()).get().catch(() => ({ docs: [] }))
+          : Promise.resolve({ docs: [] }),
       ]);
 
       const pruneBatch = db.batch();
@@ -510,6 +516,8 @@ class ArchiveMigrationService {
       (certsByUidSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (attRecordsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (subTestsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (regReqsByUidSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (regReqsByIdSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
 
       await pruneBatch.commit();
       auditLog.firestorePruned = true;
@@ -815,15 +823,27 @@ class ArchiveMigrationService {
   }
 
   /**
-   * Get single completed student full dossier by studentUid
+   * Get single completed student full dossier by studentUid, studentId, or email
    */
-  static async getArchivedStudentDetails(studentUid) {
-    if (!studentUid) throw new Error('studentUid is required');
+  static async getArchivedStudentDetails(studentUid, studentId = null, email = null) {
     await connectMongo();
 
-    const student = await ArchivedStudent.findOne({ studentUid }).lean();
+    const orClauses = [];
+    if (studentUid) orClauses.push({ studentUid });
+    if (studentId) {
+      orClauses.push({ studentId: studentId.toUpperCase() }, { studentId });
+    }
+    if (email) {
+      orClauses.push({ internalEmail: email.toLowerCase() }, { email: email.toLowerCase() });
+    }
+
+    if (orClauses.length === 0) {
+      throw new Error('Student identifier is required to fetch archived record');
+    }
+
+    const student = await ArchivedStudent.findOne({ $or: orClauses }).lean();
     if (!student) {
-      throw new Error(`Archived student record not found for UID: ${studentUid}`);
+      throw new Error(`Archived student record not found for: ${studentUid || studentId || email}`);
     }
     return student;
   }
