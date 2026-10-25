@@ -395,53 +395,79 @@ class ArchiveMigrationService {
       }
       auditLog.verificationPassed = true;
 
-      // 6. Safe Firestore State Transition & Pruning
-      // Update student document in Firestore to minimal tombstone status
-      await db.collection('students').doc(studentUid).set(
-        {
-          status: 'Completed',
-          isArchived: true,
-          archivedAt: FieldValue.serverTimestamp(),
-          archivedTo: 'mongodb',
-          completionDate,
-          updatedAt: FieldValue.serverTimestamp(),
+      // 6. Safe Firestore State Transition & Comprehensive Storage Pruning
+      // Replace student document in Firestore with a minimal lightweight tombstone (NO merge)
+      // to prune all heavy fields (photo base64 data, addresses, document uploads) and reduce storage.
+      await db.collection('students').doc(studentUid).set({
+        id: studentUid,
+        uid: studentUid,
+        studentId: sData.studentId || sData.rollNo || '',
+        name: sData.name || '',
+        course: sData.course || '',
+        batch: sData.batch || '',
+        status: 'Completed',
+        isArchived: true,
+        archivedAt: FieldValue.serverTimestamp(),
+        archivedTo: 'mongodb',
+        completionDate,
+        summary: {
+          totalFee,
+          paidFee,
+          pendingFee,
+          attendancePct: Number(sData.attendancePct || 0),
+          testsCount: testResults.length,
+          certificatesCount: certificates.length,
         },
-        { merge: true }
-      );
+        updatedAt: FieldValue.serverTimestamp(),
+      });
 
       // Update lookup mapping status
       const studentIdNorm = sData.studentId || sData.rollNo;
       if (studentIdNorm) {
         try {
-          await db.collection('student_id_lookup').doc(studentIdNorm.toUpperCase()).set(
-            {
-              status: 'Completed',
-              isArchived: true,
-              archivedAt: FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
+          await db.collection('student_id_lookup').doc(studentIdNorm.toUpperCase()).set({
+            studentUid,
+            status: 'Completed',
+            isArchived: true,
+            archivedAt: FieldValue.serverTimestamp(),
+          });
         } catch (_) {}
       }
 
-      // Prune heavy operational documents from Firestore (idempotent deletes)
+      // Prune ALL heavy operational documents from Firestore to maximize storage reduction
+      const [
+        enrDoc,
+        qrSnap,
+        paymentsSnapToPrune,
+        testsSnapToPrune,
+        certsSnapToPrune,
+        certsByUidSnapToPrune,
+        attRecordsSnapToPrune,
+      ] = await Promise.all([
+        db.collection('enrollments').doc(`enr_${studentUid}`).get().catch(() => ({ exists: false })),
+        db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('fee_payments').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('test_submissions').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('certificates').where('studentId', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('certificates').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        db.collection('students').doc(studentUid).collection('attendance_records').get().catch(() => ({ docs: [] })),
+      ]);
+
       const pruneBatch = db.batch();
 
       // Prune fee account
       if (feeDoc.exists) {
         pruneBatch.delete(feeDoc.ref);
       }
-
-      // Fetch enrollment and QR tokens concurrently for pruning
-      const [enrDoc, qrSnap] = await Promise.all([
-        db.collection('enrollments').doc(`enr_${studentUid}`).get().catch(() => ({ exists: false })),
-        db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ forEach: () => {} })),
-      ]);
-
       if (enrDoc.exists) {
         pruneBatch.delete(enrDoc.ref);
       }
-      qrSnap.forEach((d) => pruneBatch.delete(d.ref));
+      (qrSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (paymentsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (testsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (certsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (certsByUidSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (attRecordsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
 
       await pruneBatch.commit();
       auditLog.firestorePruned = true;
@@ -629,17 +655,22 @@ class ArchiveMigrationService {
         throw new Error(`Data integrity verification failed for batch ${batchId} in MongoDB`);
       }
 
-      // 6. Update Batch in Firestore: status: 'Archived', isArchived: true
-      await db.collection('batches').doc(batchId).set(
-        {
-          status: 'Archived',
-          isArchived: true,
-          archivedAt: FieldValue.serverTimestamp(),
-          archivedTo: 'mongodb',
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+      // 6. Update Batch in Firestore: Replace with lightweight tombstone (NO merge)
+      // to prune all heavy student arrays, schedules, and metadata from Firestore
+      await db.collection('batches').doc(batchId).set({
+        id: batchId,
+        batchId: batchId,
+        code: bData.code || '',
+        name: bData.name || '',
+        course: bData.course || '',
+        status: 'Archived',
+        isArchived: true,
+        archivedAt: FieldValue.serverTimestamp(),
+        archivedTo: 'mongodb',
+        studentCount: migratedStudents.length,
+        completionDate: this.getTodayIST(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
 
       // 7. Complete Audit Log
       auditLog.verificationPassed = true;
@@ -679,83 +710,16 @@ class ArchiveMigrationService {
   }
 
   // ==========================================================================
-  // ROLLBACK CAPABILITY
+  // PERMANENT ARCHIVE ENFORCEMENT (NO ROLLBACK)
   // ==========================================================================
 
   /**
-   * Rollback a migration by restoring student/batch status and operational data to Firestore
+   * Rollback is intentionally permanently disabled as requested to preserve maximum Firestore storage reduction
    */
-  static async rollbackMigration({ migrationId, adminUid = 'admin' }) {
-    if (!migrationId) throw new Error('migrationId is required for rollback');
-
-    await connectMongo();
-
-    const auditLog = await MigrationAuditLog.findOne({ migrationId });
-    if (!auditLog) {
-      throw new Error(`Migration audit record ${migrationId} not found`);
-    }
-
-    if (auditLog.status === 'ROLLED_BACK') {
-      return { success: true, message: 'Migration was already rolled back' };
-    }
-
-    const studentUids = auditLog.studentUids || [];
-
-    for (const uid of studentUids) {
-      const archived = await ArchivedStudent.findOne({ studentUid: uid });
-      if (archived && archived.originalSnapshot) {
-        const origStudent = archived.originalSnapshot.student || {};
-        const origFee = archived.originalSnapshot.feeAccount || null;
-
-        // Restore Student status to Active in Firestore
-        await db.collection('students').doc(uid).set(
-          {
-            ...origStudent,
-            status: 'Active',
-            isArchived: false,
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-
-        // Restore fee account if it was present
-        if (origFee && Object.keys(origFee).length > 0) {
-          await db.collection('fee_accounts').doc(`fee_${uid}`).set(origFee, { merge: true });
-        }
-      }
-    }
-
-    // If batch migration, restore batch
-    if (auditLog.type === 'batch') {
-      const archivedBatch = await ArchivedBatch.findOne({ batchId: auditLog.targetId });
-      if (archivedBatch && archivedBatch.originalSnapshot) {
-        await db.collection('batches').doc(auditLog.targetId).set(
-          {
-            ...archivedBatch.originalSnapshot,
-            status: 'Active',
-            isArchived: false,
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
-    }
-
-    auditLog.status = 'ROLLED_BACK';
-    auditLog.details = {
-      ...(auditLog.details || {}),
-      rolledBackAt: new Date(),
-      rolledBackBy: adminUid,
-    };
-    await auditLog.save();
-
-    console.log(`[ROLLBACK SUCCESS] Migration ${migrationId} rolled back successfully.`);
-    return {
-      success: true,
-      migrationId,
-      status: 'ROLLED_BACK',
-      restoredStudentCount: studentUids.length,
-    };
+  static async rollbackMigration() {
+    throw new Error(
+      'Rollback is permanently disabled. Operational records have been pruned from Cloud Firestore to optimize database storage. All student and batch transcripts are preserved in MongoDB cold storage.'
+    );
   }
 
   // ==========================================================================

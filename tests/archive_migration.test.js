@@ -250,31 +250,25 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
     assert.equal(fsBatch.data().isArchived, true);
   });
 
-  // 9. Rollback migration
-  await t.test('9. POST /api/archive/rollback/:migrationId restores student to Active and restores fee account', async () => {
-    assert.ok(executedMigrationId, 'Must have migration ID to rollback');
+  // 9. Rollback is permanently disabled to preserve Firestore storage reduction
+  await t.test('9. POST /api/archive/rollback/:migrationId is rejected because operational records were pruned from Firestore', async () => {
+    assert.ok(executedMigrationId, 'Must have migration ID to test rollback attempt');
     const res = await fetch(`${baseUrl}/api/archive/rollback/${executedMigrationId}`, {
       method: 'POST',
       headers: { Authorization: 'Bearer mock_admin_master' },
     });
 
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 400);
     const body = await res.json();
-    assert.equal(body.success, true);
+    assert.equal(body.success, false);
+    assert.ok(body.error.includes('Rollback is permanently disabled'));
 
-    // Verify student is restored to Active in Firestore
-    const restoredStudent = await db.collection('students').doc(testStudentUid).get();
-    assert.equal(restoredStudent.data().status, 'Active');
-    assert.equal(restoredStudent.data().isArchived, false);
+    // Verify operational records were pruned from Firestore to reduce storage
+    const prunedFee = await db.collection('fee_accounts').doc(`fee_${testStudentUid}`).get();
+    assert.equal(prunedFee.exists, false);
 
-    // Verify fee account is restored in Firestore
-    const restoredFee = await db.collection('fee_accounts').doc(`fee_${testStudentUid}`).get();
-    assert.equal(restoredFee.exists, true);
-    assert.equal(restoredFee.data().totalFee, 15000);
-
-    // Verify audit log status
-    const log = await MigrationAuditLog.findOne({ migrationId: executedMigrationId });
-    assert.equal(log.status, 'ROLLED_BACK');
+    const prunedEnrollment = await db.collection('enrollments').doc(`enr_${testStudentUid}`).get();
+    assert.equal(prunedEnrollment.exists, false);
   });
 
   // Cleanup test fixtures

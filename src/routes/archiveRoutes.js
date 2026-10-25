@@ -127,26 +127,13 @@ router.post('/batch/:batchId/execute', verifyAdminAuth, async (req, res, next) =
 
 /**
  * POST /api/archive/rollback/:migrationId
- * Restore archived student and batch records to active state in Firestore
+ * Rollback is permanently disabled to optimize and protect pruned Firestore storage
  */
-router.post('/rollback/:migrationId', verifyAdminAuth, async (req, res, next) => {
-  try {
-    const { migrationId } = req.params;
-    const adminUid = req.adminUser?.uid || 'admin';
-
-    const result = await ArchiveMigrationService.rollbackMigration({
-      migrationId,
-      adminUid,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: `Migration ${migrationId} rolled back successfully.`,
-      data: result,
-    });
-  } catch (err) {
-    next(err);
-  }
+router.post('/rollback/:migrationId', verifyAdminAuth, async (req, res) => {
+  res.status(400).json({
+    success: false,
+    error: 'Rollback is permanently disabled. Operational records have been pruned from Cloud Firestore to optimize database storage.',
+  });
 });
 
 /**
