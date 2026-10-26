@@ -40,6 +40,9 @@ class StudentRegistrationService {
       installmentsCount = 1,
       installmentFrequency = 'Monthly (Every 30 Days)',
       installments = [],
+      feeBreakdown = null,
+      concessionReason = '',
+      examInstallments = [],
       instituteShortCode,
     } = payload;
 
@@ -250,6 +253,34 @@ class StudentRegistrationService {
           updatedAt: FieldValue.serverTimestamp(),
         };
 
+        // Fee components calculation
+        const parsedFeeBreakdown = (feeBreakdown && typeof feeBreakdown === 'object') ? feeBreakdown : {};
+        const admFee = Number(parsedFeeBreakdown.admissionFee) || 0;
+        const totalExamFee = Number(parsedFeeBreakdown.totalExamFee) || 0;
+        const otherFee = Number(parsedFeeBreakdown.otherFee) || 0;
+        const tuitionFee = Number(parsedFeeBreakdown.tuitionFee) || Math.max(0, totalNum - admFee - totalExamFee - otherFee);
+
+        const admissionPaid = Math.min(paidNum, admFee);
+        const tuitionPaid = Math.max(0, paidNum - admFee);
+
+        studentData.admissionFee = admFee;
+        studentData.admissionPaid = admissionPaid;
+        studentData.tuitionPaid = tuitionPaid;
+        studentData.examFeePaid = 0;
+        studentData.feeBreakdown = {
+          admissionFee: admFee,
+          tuitionFee,
+          numberOfExams: Number(parsedFeeBreakdown.numberOfExams) || 0,
+          examFeePerExam: Number(parsedFeeBreakdown.examFeePerExam) || 0,
+          totalExamFee,
+          otherFee,
+          standardTotal: Number(parsedFeeBreakdown.standardTotal) || totalNum,
+          concessionDiscount: Number(parsedFeeBreakdown.concessionDiscount) || 0,
+          concessionType: parsedFeeBreakdown.concessionType || 'None',
+          concessionReason: concessionReason || parsedFeeBreakdown.concessionReason || '',
+          finalApplicableFee: totalNum,
+        };
+
         // F. Enrollment Record Data
         const enrollmentData = {
           id: `enr_${predeterminedUid}`,
@@ -264,6 +295,9 @@ class StudentRegistrationService {
         };
 
         // G. Fee Account Data
+        const nowReceiptSuffix = Date.now().toString().slice(-7);
+        const admissionReceiptNo = `REC-ADM-${studentId}-${nowReceiptSuffix}`;
+
         const feeAccountData = {
           id: `fee_${predeterminedUid}`,
           studentId,
@@ -271,13 +305,58 @@ class StudentRegistrationService {
           totalFee: totalNum,
           paidFee: paidNum,
           pendingFee: pendingNum,
+          admissionFee: admFee,
+          admissionPaid,
+          admissionPending: Math.max(0, admFee - admissionPaid),
+          tuitionFee,
+          tuitionPaid,
+          tuitionPending: Math.max(0, tuitionFee - tuitionPaid),
+          totalExamFee,
+          examFeePaid: 0,
+          examFeePending: totalExamFee,
+          otherFee,
+          otherFeePaid: 0,
+          otherFeePending: otherFee,
+          feeBreakdown: studentData.feeBreakdown,
           isInstallmentPlan: Boolean(isInstallmentPlan),
           installmentsCount: Number(installmentsCount),
           installmentFrequency,
           installments: Array.isArray(installments) ? installments : [],
+          examInstallments: Array.isArray(examInstallments) ? examInstallments : [],
           status: pendingNum === 0 ? 'Fully Paid' : 'Active',
+          lastPaymentAmount: paidNum > 0 ? paidNum : 0,
+          lastReceiptNo: paidNum > 0 ? admissionReceiptNo : null,
           createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         };
+
+        // If down payment made at registration, create verified fee receipt atomically
+        if (paidNum > 0) {
+          const paymentRef = db.collection('fee_payments').doc();
+          const nowFormatted = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+          const paymentRecord = {
+            id: paymentRef.id,
+            studentUid: predeterminedUid,
+            studentName: name.trim(),
+            studentRoll: studentId,
+            courseName: course,
+            batchName: batch,
+            installmentNumber: 1,
+            installmentTitle: paidNum >= totalNum ? 'Full Course Fee Payment' : 'Admission Fee / Down Payment',
+            amount: paidNum,
+            paymentDate: nowFormatted,
+            paymentMode: 'Cash',
+            transactionId: `ADM-${nowReceiptSuffix}`,
+            receiptNo: admissionReceiptNo,
+            status: 'Approved',
+            feeCategory: paidNum >= totalNum ? 'Tuition Installment' : 'Admission Fee',
+            concessionReason: concessionReason || parsedFeeBreakdown.concessionReason || '',
+            remarks: 'Recorded at student admission down payment',
+            collectedBy: 'Admin',
+            createdAt: FieldValue.serverTimestamp(),
+          };
+          transaction.set(paymentRef, paymentRecord);
+        }
 
         // H. Student ID Lookup (for student login)
         const deterministicEmail = `${studentId.toLowerCase()}@${instituteConfig.internalEmailDomain}`;
