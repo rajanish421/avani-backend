@@ -149,13 +149,23 @@ class StudentRegistrationService {
     // 5. Final Atomic Firestore Transaction
     // Assigns student ID, writes student, enrollment, fees, lookup and updates counter
     // Uses isolated counter for tests to prevent burning production student sequences
-    const counterDocId = (process.env.NODE_ENV === 'test' || process.env.IS_TEST)
-      ? 'student_id_test'
-      : 'student_id';
+    const isTestMode = (process.env.NODE_ENV === 'test' || process.env.IS_TEST);
+    const counterDocId = isTestMode ? 'student_id_test' : 'student_id';
     const counterRef = db.collection('system_counters').doc(counterDocId);
     const studentRef = db.collection('students').doc(predeterminedUid);
     const enrollmentRef = db.collection('enrollments').doc(`enr_${predeterminedUid}`);
     const feeAccountRef = db.collection('fee_accounts').doc(`fee_${predeterminedUid}`);
+
+    // Self-heal sequence counter if document does not exist or lags behind max allocated student sequence
+    const maxAllocated = await this.getHighestAllocatedSequence(shortCode);
+    const initialCounterSnap = await counterRef.get();
+    if (!initialCounterSnap.exists || (Number(initialCounterSnap.data()?.currentValue) || 0) < maxAllocated) {
+      await counterRef.set({
+        currentValue: maxAllocated,
+        prefix: shortCode,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
 
     // Look up batch doc if provided
     let batchRef = null;
@@ -206,17 +216,32 @@ class StudentRegistrationService {
         const counterDoc = await transaction.get(counterRef);
         let currentCounter = 0;
         if (counterDoc.exists) {
-          currentCounter = counterDoc.data().currentValue || 0;
+          currentCounter = Number(counterDoc.data().currentValue) || 0;
         }
-        const nextCounter = currentCounter + 1;
-        const studentId = instituteConfig.formatStudentId(nextCounter, shortCode);
+        let allocatedCounter = currentCounter + 1;
+        let allocatedStudentId = instituteConfig.formatStudentId(allocatedCounter, shortCode);
 
-        // D. Check student ID lookup collision
-        const lookupRef = db.collection('student_id_lookup').doc(studentId);
-        const lookupDoc = await transaction.get(lookupRef);
-        if (lookupDoc.exists && lookupDoc.data().uid !== predeterminedUid) {
-          throw new Error(`Counter conflict: Student ID ${studentId} is already allocated.`);
+        // D. Check student ID lookup collision and auto-advance to next free sequence if already allocated
+        let lookupRef = db.collection('student_id_lookup').doc(allocatedStudentId);
+        let lookupDoc = await transaction.get(lookupRef);
+        let collisionAttempts = 0;
+        while (lookupDoc.exists && lookupDoc.data().uid !== predeterminedUid && collisionAttempts < 100) {
+          allocatedCounter++;
+          allocatedStudentId = instituteConfig.formatStudentId(allocatedCounter, shortCode);
+          lookupRef = db.collection('student_id_lookup').doc(allocatedStudentId);
+          lookupDoc = await transaction.get(lookupRef);
+          collisionAttempts++;
         }
+
+        if (lookupDoc.exists && lookupDoc.data().uid !== predeterminedUid) {
+          const err = new Error(`Student ID sequence is currently busy. Please retry in a few moments.`);
+          err.statusCode = 409;
+          err.code = 'STUDENT_ID_ALLOCATION_BUSY';
+          throw err;
+        }
+
+        const studentId = allocatedStudentId;
+        const nextCounter = allocatedCounter;
 
         const totalNum = Number.isFinite(Number(totalFee)) ? Number(totalFee) : 0;
         const paidNum = Number.isFinite(Number(downPayment)) ? Number(downPayment) : 0;
@@ -554,6 +579,41 @@ class StudentRegistrationService {
       status: status.status,
       message: `Registration is in state: ${status.status}`,
     };
+  }
+
+  /**
+   * Discovers the highest student sequence number currently allocated in Firestore
+   * (checks student_id_lookup and students collections) to auto-heal missing or lagged counters.
+   */
+  async getHighestAllocatedSequence(shortCode) {
+    let highest = 0;
+    try {
+      const snap = await db.collection('student_id_lookup').orderBy('studentId', 'desc').limit(1).get();
+      if (!snap.empty) {
+        const docId = snap.docs[0].id;
+        const num = parseInt(docId.replace(/\D/g, ''), 10);
+        if (Number.isFinite(num) && num > highest) {
+          highest = num;
+        }
+      }
+    } catch (e) {
+      console.warn('[REGISTRATION] Could not query highest student_id_lookup:', e.message);
+    }
+
+    try {
+      const snap = await db.collection('students').orderBy('rollNo', 'desc').limit(1).get();
+      if (!snap.empty) {
+        const roll = snap.docs[0].data()?.rollNo || snap.docs[0].data()?.studentId || '';
+        const num = parseInt(String(roll).replace(/\D/g, ''), 10);
+        if (Number.isFinite(num) && num > highest) {
+          highest = num;
+        }
+      }
+    } catch (e) {
+      console.warn('[REGISTRATION] Could not query highest students doc:', e.message);
+    }
+
+    return highest;
   }
 }
 
