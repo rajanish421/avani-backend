@@ -260,13 +260,37 @@ class StudentRegistrationService {
         const otherFee = Number(parsedFeeBreakdown.otherFee) || 0;
         const tuitionFee = Number(parsedFeeBreakdown.tuitionFee) || Math.max(0, totalNum - admFee - totalExamFee - otherFee);
 
+        // Calculate exam fee paid from examInstallments payload if provided
+        let examFeePaid = 0;
+        if (Array.isArray(examInstallments)) {
+          for (const ex of examInstallments) {
+            if (ex && (String(ex.status).toLowerCase() === 'paid')) {
+              examFeePaid += Number(ex.amount) || 0;
+            }
+          }
+        }
+        if (Number.isFinite(Number(parsedFeeBreakdown.examFeePaid))) {
+          examFeePaid = Math.max(examFeePaid, Number(parsedFeeBreakdown.examFeePaid));
+        }
+
         const admissionPaid = Math.min(paidNum, admFee);
-        const tuitionPaid = Math.max(0, paidNum - admFee);
+        const remPaid = Math.max(0, paidNum - admissionPaid - examFeePaid);
+        const tuitionPaid = Math.min(tuitionFee, remPaid);
 
         studentData.admissionFee = admFee;
         studentData.admissionPaid = admissionPaid;
+        studentData.admissionPending = Math.max(0, admFee - admissionPaid);
+        studentData.tuitionFee = tuitionFee;
         studentData.tuitionPaid = tuitionPaid;
-        studentData.examFeePaid = 0;
+        studentData.tuitionPending = Math.max(0, tuitionFee - tuitionPaid);
+        studentData.totalExamFee = totalExamFee;
+        studentData.examFeePaid = examFeePaid;
+        studentData.examFeePending = Math.max(0, totalExamFee - examFeePaid);
+        studentData.otherFee = otherFee;
+        studentData.otherFeePaid = 0;
+        studentData.otherFeePending = otherFee;
+        studentData.concessionDiscount = Number(parsedFeeBreakdown.concessionDiscount) || 0;
+        studentData.concessionReason = concessionReason || parsedFeeBreakdown.concessionReason || '';
         studentData.feeBreakdown = {
           admissionFee: admFee,
           tuitionFee,
@@ -312,8 +336,8 @@ class StudentRegistrationService {
           tuitionPaid,
           tuitionPending: Math.max(0, tuitionFee - tuitionPaid),
           totalExamFee,
-          examFeePaid: 0,
-          examFeePending: totalExamFee,
+          examFeePaid,
+          examFeePending: Math.max(0, totalExamFee - examFeePaid),
           otherFee,
           otherFeePaid: 0,
           otherFeePending: otherFee,
