@@ -56,18 +56,28 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
+// Root & health check endpoints (for Render, uptime monitors, and browser verification)
+const handleHealthCheck = (req, res) => {
   res.status(200).json({
     status: 'ok',
+    message: 'Avani Computer Institute Backend API is live and healthy.',
     service: 'Avani Institute Backend',
+    environment: process.env.NODE_ENV || 'development',
     database: {
       firestore: 'connected',
       mongodb: isMongoConnected() ? 'connected' : 'disconnected',
     },
+    endpoints: {
+      health: '/api/health',
+      students: '/api/students',
+      notifications: '/api/notifications',
+      archive: '/api/archive',
+    },
     timestamp: new Date().toISOString(),
   });
-});
+};
+
+app.all(['/', '/health', '/api/health'], handleHealthCheck);
 
 // Mount routes
 app.use('/api/students', studentRoutes);
