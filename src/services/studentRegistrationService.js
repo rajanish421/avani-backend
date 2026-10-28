@@ -247,6 +247,9 @@ class StudentRegistrationService {
         const paidNum = Number.isFinite(Number(downPayment)) ? Number(downPayment) : 0;
         const pendingNum = Math.max(0, totalNum - paidNum);
 
+        // Generate unpredictable QR token for student attendance pass
+        const qrToken = 'tok_' + crypto.randomBytes(16).toString('hex');
+
         // E. Student Record Data
         const studentData = {
           id: predeterminedUid,
@@ -273,6 +276,8 @@ class StudentRegistrationService {
           pendingFees: pendingNum,
           status: 'Active',
           avatarUrl: photoUrl || '',
+          qrToken,
+          qrTokenCreatedAt: FieldValue.serverTimestamp(),
           mustChangePassword: true,
           createdAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
@@ -391,14 +396,26 @@ class StudentRegistrationService {
             courseName: course,
             batchName: batch,
             installmentNumber: 1,
-            installmentTitle: paidNum >= totalNum ? 'Full Course Fee Payment' : 'Admission Fee / Down Payment',
+            installmentTitle: (admissionPaid > 0 && tuitionPaid > 0)
+              ? 'Admission & Initial Down Payment'
+              : (paidNum >= totalNum ? 'Full Course Fee Payment' : (admissionPaid > 0 ? 'Admission Fee Payment' : 'Tuition Down Payment')),
             amount: paidNum,
+            admissionPaid: admissionPaid,
+            tuitionPaid: tuitionPaid,
+            examFeePaid: examFeePaid,
+            breakdown: {
+              admissionFee: admissionPaid,
+              tuitionDownPayment: tuitionPaid,
+              examFee: examFeePaid,
+            },
             paymentDate: nowFormatted,
             paymentMode: 'Cash',
             transactionId: `ADM-${nowReceiptSuffix}`,
             receiptNo: admissionReceiptNo,
             status: 'Approved',
-            feeCategory: paidNum >= totalNum ? 'Tuition Installment' : 'Admission Fee',
+            feeCategory: (admissionPaid > 0 && tuitionPaid > 0)
+              ? 'Initial Admission Payment'
+              : (paidNum >= totalNum ? 'Tuition Installment' : (admissionPaid > 0 ? 'Admission Fee' : 'Tuition Down Payment')),
             concessionReason: concessionReason || parsedFeeBreakdown.concessionReason || '',
             remarks: 'Recorded at student admission down payment',
             collectedBy: 'Admin',
@@ -418,11 +435,26 @@ class StudentRegistrationService {
           createdAt: FieldValue.serverTimestamp(),
         };
 
+        // QR Token lookup document for fast attendance scanning
+        const qrTokenRef = db.collection('qr_tokens').doc(qrToken);
+        const qrTokenData = {
+          token: qrToken,
+          studentUid: predeterminedUid,
+          studentId,
+          rollNo: studentId,
+          studentName: name.trim(),
+          course,
+          batch,
+          status: 'Active',
+          createdAt: FieldValue.serverTimestamp(),
+        };
+
         // I. Atomic Writes
         transaction.set(studentRef, { ...studentData, internalEmail: deterministicEmail });
         transaction.set(enrollmentRef, enrollmentData);
         transaction.set(feeAccountRef, feeAccountData);
         transaction.set(lookupRef, lookupData);
+        transaction.set(qrTokenRef, qrTokenData);
         transaction.set(counterRef, {
           currentValue: nextCounter,
           prefix: shortCode,
