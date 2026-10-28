@@ -4,6 +4,8 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 process.env.NODE_ENV = 'test';
 process.env.ALLOW_TEST_AUTH = 'true';
+// For local integration testing, use local running mongod if Atlas is not reachable
+process.env.MONGODB_URI = process.env.TEST_MONGO_URI || 'mongodb://127.0.0.1:27017/avani_institute_archive_test';
 
 const app = require('../src/app');
 const { db } = require('../src/config/firebase');
@@ -35,6 +37,13 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
   const testStudentUid = `test_mig_stu_${Date.now()}`;
   const testStudentId = `ACI99991`;
   const testBatchId = `test_mig_batch_${Date.now()}`;
+  const batchWiseTestId = `test_exam_batchwise_${Date.now()}`;
+  const allBatchesTestId = `test_exam_allbatches_${Date.now()}`;
+  const otherBatchTestId = `test_exam_otherbatch_${Date.now()}`;
+  const batchAttDocId = `test_att_batch_${Date.now()}`;
+  const otherAttDocId = `test_att_other_${Date.now()}`;
+  const studentPaymentId = `test_pay_${Date.now()}`;
+  const studentSubId = `test_sub_${Date.now()}`;
   let executedMigrationId = null;
 
   // Setup mock batch & student in Firestore
@@ -95,6 +104,69 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
       course: 'Diploma in Computer Application',
       batch: 'Test DCA Evening Batch',
       status: 'Active',
+    });
+
+    await db.collection('fee_payments').doc(studentPaymentId).set({
+      id: studentPaymentId,
+      studentUid: testStudentUid,
+      studentRoll: testStudentId,
+      amount: 5000,
+      status: 'Approved',
+      receiptNo: 'REC-TEST-99991-01',
+    });
+
+    await db.collection('test_submissions').doc(studentSubId).set({
+      id: studentSubId,
+      studentUid: testStudentUid,
+      studentRoll: testStudentId,
+      testId: batchWiseTestId,
+      score: 85,
+    });
+
+    // 1) Batch-wise test for THIS batch
+    await db.collection('tests').doc(batchWiseTestId).set({
+      id: batchWiseTestId,
+      title: 'DCA Module 1 Internal Exam',
+      targetType: 'batch',
+      batch: 'Test DCA Evening Batch',
+      batchId: testBatchId,
+      status: 'Completed',
+    });
+
+    // 2) General test for ALL batches
+    await db.collection('tests').doc(allBatchesTestId).set({
+      id: allBatchesTestId,
+      title: 'Annual Institute General Assessment',
+      targetType: 'all',
+      status: 'Scheduled',
+    });
+
+    // 3) Batch-wise test for ANOTHER batch
+    await db.collection('tests').doc(otherBatchTestId).set({
+      id: otherBatchTestId,
+      title: 'Java Morning Quiz',
+      targetType: 'batch',
+      batch: 'Morning Java Batch',
+      batchId: 'other_batch_id_999',
+      status: 'Scheduled',
+    });
+
+    // 4) Attendance for THIS batch
+    await db.collection('attendance').doc(batchAttDocId).set({
+      id: batchAttDocId,
+      batchId: testBatchId,
+      batch: 'Test DCA Evening Batch',
+      studentUid: testStudentUid,
+      status: 'present',
+    });
+
+    // 5) Attendance for OTHER batch
+    await db.collection('attendance').doc(otherAttDocId).set({
+      id: otherAttDocId,
+      batchId: 'other_batch_id_999',
+      batch: 'Morning Java Batch',
+      studentUid: 'other_student_uid_777',
+      status: 'present',
     });
   });
 
@@ -245,6 +317,30 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
     // Verify Firestore Batch is completely pruned/deleted to reduce database storage to zero
     const fsBatch = await db.collection('batches').doc(testBatchId).get();
     assert.equal(fsBatch.exists, false, 'Batch document must be completely pruned from Firestore to reduce storage');
+
+    // Verify batch-wise test is deleted, but 'all' batches test and other-batch test remain untouched!
+    const batchTestDoc = await db.collection('tests').doc(batchWiseTestId).get();
+    assert.equal(batchTestDoc.exists, false, 'Batch-wise test must be pruned when batch is migrated');
+
+    const allBatchesDoc = await db.collection('tests').doc(allBatchesTestId).get();
+    assert.equal(allBatchesDoc.exists, true, 'Test for ALL batches must NOT be deleted');
+
+    const otherBatchDoc = await db.collection('tests').doc(otherBatchTestId).get();
+    assert.equal(otherBatchDoc.exists, true, 'Test for another batch must NOT be deleted');
+
+    // Verify batch attendance is deleted, but other-batch attendance remains untouched!
+    const batchAttDoc = await db.collection('attendance').doc(batchAttDocId).get();
+    assert.equal(batchAttDoc.exists, false, 'Batch attendance must be pruned when batch is migrated');
+
+    const otherAttDoc = await db.collection('attendance').doc(otherAttDocId).get();
+    assert.equal(otherAttDoc.exists, true, 'Attendance for another batch must NOT be deleted');
+
+    // Verify student payments and test submissions are pruned
+    const payDoc = await db.collection('fee_payments').doc(studentPaymentId).get();
+    assert.equal(payDoc.exists, false, 'Student fee payments must be pruned from Firestore');
+
+    const subDoc = await db.collection('test_submissions').doc(studentSubId).get();
+    assert.equal(subDoc.exists, false, 'Student test submissions must be pruned from Firestore');
   });
 
   // 9. Rollback is permanently disabled to preserve Firestore storage reduction
@@ -274,6 +370,9 @@ test('=== Archive & Migration System Suite (MongoDB + Firestore) ===', async (t)
     await db.collection('batches').doc(testBatchId).delete();
     await db.collection('fee_accounts').doc(`fee_${testStudentUid}`).delete();
     await db.collection('enrollments').doc(`enr_${testStudentUid}`).delete();
+    await db.collection('tests').doc(allBatchesTestId).delete();
+    await db.collection('tests').doc(otherBatchTestId).delete();
+    await db.collection('attendance').doc(otherAttDocId).delete();
     await ArchivedStudent.deleteMany({ studentUid: testStudentUid });
     await ArchivedBatch.deleteMany({ batchId: testBatchId });
     await MigrationAuditLog.deleteMany({ targetId: { $in: [testStudentUid, testBatchId] } });

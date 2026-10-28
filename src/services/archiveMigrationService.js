@@ -465,16 +465,19 @@ class ArchiveMigrationService {
       // 6. Complete Firestore Purge: Delete all records from Firestore to reduce database storage to zero
       const studentIdNorm = sData.studentId || sData.rollNo;
 
-      // Prune ALL heavy operational documents and registration requests from Firestore to maximize storage reduction
+      // Prune ALL heavy operational documents, payments, submissions, attendance and registration requests from Firestore
       const [
         enrDoc,
         qrSnap,
         paymentsSnapToPrune,
         testsSnapToPrune,
+        subTestsByRollSnap,
         certsSnapToPrune,
         certsByUidSnapToPrune,
         attRecordsSnapToPrune,
         subTestsSnapToPrune,
+        legacyAttSnap,
+        legacyAttByRollSnap,
         regReqsByUidSnap,
         regReqsByIdSnap,
       ] = await Promise.all([
@@ -482,10 +485,17 @@ class ArchiveMigrationService {
         db.collection('qr_tokens').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('fee_payments').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('test_submissions').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        studentIdNorm
+          ? db.collection('test_submissions').where('studentRoll', '==', studentIdNorm).get().catch(() => ({ docs: [] }))
+          : Promise.resolve({ docs: [] }),
         db.collection('certificates').where('studentId', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('certificates').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
         db.collection('students').doc(studentUid).collection('attendance_records').get().catch(() => ({ docs: [] })),
         db.collection('students').doc(studentUid).collection('test_submissions').get().catch(() => ({ docs: [] })),
+        db.collection('attendance').where('studentUid', '==', studentUid).get().catch(() => ({ docs: [] })),
+        studentIdNorm
+          ? db.collection('attendance').where('studentRoll', '==', studentIdNorm).get().catch(() => ({ docs: [] }))
+          : Promise.resolve({ docs: [] }),
         db.collection('registration_requests').where('uid', '==', studentUid).get().catch(() => ({ docs: [] })),
         studentIdNorm
           ? db.collection('registration_requests').where('studentId', '==', studentIdNorm.toUpperCase()).get().catch(() => ({ docs: [] }))
@@ -512,14 +522,37 @@ class ArchiveMigrationService {
       (qrSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (paymentsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (testsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (subTestsByRollSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (certsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (certsByUidSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (attRecordsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (subTestsSnapToPrune.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (legacyAttSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
+      (legacyAttByRollSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (regReqsByUidSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
       (regReqsByIdSnap.docs || []).forEach((d) => pruneBatch.delete(d.ref));
 
       await pruneBatch.commit();
+
+      // Disassociate student from their batch assignedStudentIds if the batch remains active
+      const batchIdToUpdate = sData.batchId;
+      if (batchIdToUpdate) {
+        try {
+          const bDoc = await db.collection('batches').doc(batchIdToUpdate).get();
+          if (bDoc.exists) {
+            const assigned = (bDoc.data().assignedStudentIds || []).filter((id) => id !== studentUid);
+            const curEnrolled = Number(bDoc.data().enrolled || 0);
+            await bDoc.ref.update({
+              assignedStudentIds: assigned,
+              enrolled: curEnrolled > 0 ? curEnrolled - 1 : 0,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        } catch (bErr) {
+          console.warn(`[ARCHIVE] Non-critical warning updating batch assignedStudentIds for ${studentUid}:`, bErr.message);
+        }
+      }
+
       auditLog.firestorePruned = true;
 
       // 7. Audit Log: COMPLETED
@@ -723,7 +756,120 @@ class ArchiveMigrationService {
         throw new Error(`Data integrity verification failed for batch ${batchId} in MongoDB`);
       }
 
-      // 6. Delete Batch in Firestore completely to reduce storage to zero
+      // 6. Complete Firestore Purge for Batch: Delete all batch-related records from Firestore
+      // a) Clean up attendance sessions and session records
+      try {
+        const sessionsSnap = await db.collection('batches').doc(batchId).collection('attendance_sessions').get().catch(() => ({ docs: [] }));
+        for (const sessionDoc of sessionsSnap.docs || []) {
+          const recordsSnap = await sessionDoc.ref.collection('records').get().catch(() => ({ docs: [] }));
+          const sBatch = db.batch();
+          (recordsSnap.docs || []).forEach((r) => sBatch.delete(r.ref));
+          sBatch.delete(sessionDoc.ref);
+          await sBatch.commit();
+        }
+      } catch (sessErr) {
+        console.warn(`[ARCHIVE] Warning cleaning up attendance sessions for batch ${batchId}:`, sessErr.message);
+      }
+
+      // b) Clean up batch attendance records from root 'attendance' collection
+      try {
+        const [attByBatchIdSnap, attByBatchNameSnap] = await Promise.all([
+          db.collection('attendance').where('batchId', '==', batchId).get().catch(() => ({ docs: [] })),
+          bData.name
+            ? db.collection('attendance').where('batch', '==', bData.name).get().catch(() => ({ docs: [] }))
+            : Promise.resolve({ docs: [] }),
+        ]);
+        const attBatch = db.batch();
+        const seenAttDocIds = new Set();
+        [...(attByBatchIdSnap.docs || []), ...(attByBatchNameSnap.docs || [])].forEach((d) => {
+          if (!seenAttDocIds.has(d.id)) {
+            seenAttDocIds.add(d.id);
+            attBatch.delete(d.ref);
+          }
+        });
+        await attBatch.commit();
+      } catch (attErr) {
+        console.warn(`[ARCHIVE] Warning cleaning up attendance records for batch ${batchId}:`, attErr.message);
+      }
+
+      // c) Clean up batch schedules / timetables
+      try {
+        const [schedByIdSnap, schedByNameSnap] = await Promise.all([
+          db.collection('schedules').where('batchId', '==', batchId).get().catch(() => ({ docs: [] })),
+          bData.name
+            ? db.collection('schedules').where('batch', '==', bData.name).get().catch(() => ({ docs: [] }))
+            : Promise.resolve({ docs: [] }),
+        ]);
+        const schedBatch = db.batch();
+        const seenSchedIds = new Set();
+        [...(schedByIdSnap.docs || []), ...(schedByNameSnap.docs || [])].forEach((d) => {
+          if (!seenSchedIds.has(d.id)) {
+            seenSchedIds.add(d.id);
+            schedBatch.delete(d.ref);
+          }
+        });
+        await schedBatch.commit();
+      } catch (schedErr) {
+        console.warn(`[ARCHIVE] Warning cleaning up schedules for batch ${batchId}:`, schedErr.message);
+      }
+
+      // d) CRITICAL: Scoped Test / Exam Cleanup
+      // Delete ONLY batch-wise tests created specifically for this batch.
+      // NEVER delete tests that are for "All Batches" (targetType == 'all') or tests assigned to other batches!
+      let prunedBatchTestsCount = 0;
+      try {
+        const testsSnap = await db.collection('tests').get().catch(() => ({ docs: [] }));
+        for (const testDoc of testsSnap.docs || []) {
+          const tData = testDoc.data();
+          const targetType = (tData.targetType || 'all').toLowerCase();
+
+          // RULE 1: If test is created for ALL batches (targetType == 'all'), DO NOT DELETE!
+          if (targetType === 'all') {
+            continue;
+          }
+
+          // RULE 2: If test targetType == 'batch', check if it matches THIS batch
+          const testBatch = tData.batch || tData.batchName || '';
+          const testBatchId = tData.batchId || '';
+          const targetBatches = Array.isArray(tData.targetBatches) ? tData.targetBatches : [];
+
+          const matchesThisBatch =
+            testBatch === bData.name ||
+            testBatch === batchId ||
+            testBatchId === batchId ||
+            targetBatches.includes(batchId) ||
+            targetBatches.includes(bData.name);
+
+          if (!matchesThisBatch) {
+            // This test belongs to another batch, DO NOT DELETE!
+            continue;
+          }
+
+          // If test targets MULTIPLE batches, do not delete the test; only remove this batch from targetBatches
+          if (targetBatches.length > 1) {
+            const remaining = targetBatches.filter((b) => b !== batchId && b !== bData.name);
+            await testDoc.ref.update({
+              targetBatches: remaining,
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`[ARCHIVE] Disassociated batch ${batchId} from multi-batch test ${testDoc.id}. Test preserved for remaining batches.`);
+            continue;
+          }
+
+          // Test is exclusively for THIS batch: delete test document and all its submissions
+          const submissionsSnap = await db.collection('test_submissions').where('testId', '==', testDoc.id).get().catch(() => ({ docs: [] }));
+          const testPruneBatch = db.batch();
+          (submissionsSnap.docs || []).forEach((sub) => testPruneBatch.delete(sub.ref));
+          testPruneBatch.delete(testDoc.ref);
+          await testPruneBatch.commit();
+          prunedBatchTestsCount++;
+          console.log(`[ARCHIVE] Pruned batch-wise test ${testDoc.id} (${tData.title || ''}) and ${submissionsSnap.docs.length} submissions for batch ${batchId}.`);
+        }
+      } catch (testErr) {
+        console.warn(`[ARCHIVE] Warning during scoped test cleanup for batch ${batchId}:`, testErr.message);
+      }
+
+      // e) Delete Batch document in Firestore completely
       await db.collection('batches').doc(batchId).delete();
 
       // 7. Complete Audit Log
@@ -736,6 +882,7 @@ class ArchiveMigrationService {
         batchName: bData.name,
         migratedCount: migratedStudents.length,
         failedCount: failedStudents.length,
+        prunedBatchTestsCount,
       };
       await auditLog.save();
 
